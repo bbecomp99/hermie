@@ -1,0 +1,11 @@
+---
+# Template for group_vars/hermes/vault.yml (the real file is gitignored).
+# Copy to vault.yml and fill in. Holds secrets referenced by the roles.
+
+# Postgres password for the Mattermost stack (mattermost role).
+# Generate one: openssl rand -hex 24
+mm_db_password: ""
+
+# Mattermost bot token for the hermes gateway (gateway role).
+# Mattermost → System Console → Integrations → Bot Accounts → Add Bot Account.
+mm_bot_token: ""

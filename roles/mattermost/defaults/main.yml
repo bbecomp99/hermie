@@ -1,0 +1,16 @@
+---
+# Self-hosted Mattermost (Slack-like) on the same host as hermes, via Docker.
+mm_dir: "{{ ansible_env.HOME }}/mattermost"     # compose project dir on .128
+mm_version: "11.6.4"                            # mattermost-team-edition tag
+mm_pg_image: "postgres:15-alpine"
+mm_port: 8065                                   # host port -> container 8065
+mm_bind: "0.0.0.0"                              # LAN-reachable
+mm_site_url: "http://{{ ansible_default_ipv4.address | default(ansible_host) }}:{{ mm_port }}"
+
+# Postgres (internal to the compose network, not published to the host).
+mm_db_user: "mmuser"
+mm_db_name: "mattermost"
+# mm_db_password comes from group_vars/hermes/vault.yml (gitignored).
+
+mm_enable: true                                 # bring the stack up
+mm_uid: 2000                                    # mattermost container runs as 2000:2000

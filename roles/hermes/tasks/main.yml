@@ -24,6 +24,14 @@
     executable: /bin/bash
     creates: "{{ hermes_local_bin }}/uv"
 
+- name: Check the currently checked-out commit (if the repo exists)
+  ansible.builtin.command: "git -C {{ hermes_dir }} rev-parse HEAD"
+  register: hermes_head
+  changed_when: false
+  failed_when: false
+
+# Skip the network fetch when we're already at the pinned commit — keeps
+# re-runs idempotent and resilient to GitHub being briefly unreachable.
 - name: Clone / update the hermes-agent repo
   ansible.builtin.git:
     repo: "{{ hermes_repo }}"
@@ -31,6 +39,7 @@
     version: "{{ hermes_version }}"
     update: true
   register: hermes_git
+  when: hermes_head.rc != 0 or hermes_head.stdout != hermes_version
 
 - name: Create the uv venv
   ansible.builtin.command:

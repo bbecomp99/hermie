@@ -1,0 +1,8 @@
+---
+- name: Recreate mattermost stack
+  become: true
+  ansible.builtin.command:
+    cmd: docker compose up -d
+    chdir: "{{ mm_dir }}"
+  changed_when: true
+  when: mm_enable

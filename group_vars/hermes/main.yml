@@ -19,3 +19,14 @@ dashboard_host: "0.0.0.0"
 dashboard_port: 9119
 dashboard_insecure: true        # required to bind off-localhost
 dashboard_tui: true             # in-browser Chat tab (talk to the agent)
+
+# --- Gateway (Mattermost channel) ---
+# hermes matches MATTERMOST_ALLOWED_USERS by Mattermost USER ID (not username).
+# This is brian's user id.
+mm_allowed_users: "xbpkc5mq9jnk8mfngpjaygz5ay"
+
+# Home channel for cron/autonomous output = Town Square (default channel,
+# team CloudLogic). Mattermost channel ID, not name.
+mm_home_channel: "bkkf739saif5tgzwaynhikgmho"
+mm_home_channel_name: "Town Square"
+# mm_bot_token lives in group_vars/hermes/vault.yml (gitignored)

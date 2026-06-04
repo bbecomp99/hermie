@@ -6,3 +6,5 @@
   roles:
     - hermes
     - dashboard
+    - mattermost
+    - gateway

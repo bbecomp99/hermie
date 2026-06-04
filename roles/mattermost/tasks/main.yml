@@ -1,0 +1,83 @@
+---
+- name: Assert the DB password is provided
+  ansible.builtin.assert:
+    that: mm_db_password is defined and (mm_db_password | length) > 0
+    fail_msg: "mm_db_password is missing — expected in group_vars/hermes/vault.yml (gitignored)."
+
+- name: Ensure docker is available
+  ansible.builtin.command: docker --version
+  changed_when: false
+
+- name: Create the compose project dir (owned by the login user)
+  become: true
+  ansible.builtin.file:
+    path: "{{ mm_dir }}"
+    state: directory
+    owner: "{{ ansible_user }}"
+    group: "{{ ansible_user }}"
+    mode: "0755"
+
+# Mattermost runs as uid:gid 2000 and does NOT fix volume perms itself, so its
+# data dirs must be writable by 2000. Postgres handles its own dir perms.
+- name: Create mattermost data dirs (owned by container uid 2000)
+  become: true
+  ansible.builtin.file:
+    path: "{{ mm_dir }}/volumes/app/{{ item }}"
+    state: directory
+    owner: "{{ mm_uid }}"
+    group: "{{ mm_uid }}"
+    mode: "0750"
+  loop:
+    - config
+    - data
+    - logs
+    - plugins
+    - client-plugins
+    - bleve-indexes
+
+- name: Create the postgres data dir
+  become: true
+  ansible.builtin.file:
+    path: "{{ mm_dir }}/volumes/postgres"
+    state: directory
+    mode: "0700"
+
+- name: Deploy the docker-compose.yml
+  become: true
+  ansible.builtin.template:
+    src: docker-compose.yml.j2
+    dest: "{{ mm_dir }}/docker-compose.yml"
+    owner: "{{ ansible_user }}"
+    group: "{{ ansible_user }}"
+    mode: "0600"            # contains the DB password
+  notify: Recreate mattermost stack
+
+- name: Bring up the Mattermost stack
+  become: true
+  ansible.builtin.command:
+    cmd: docker compose up -d
+    chdir: "{{ mm_dir }}"
+  register: mm_up
+  # .128 has broken IPv6 routing; the first-run image pull can fail
+  # intermittently before Docker falls back to IPv4. Retry a few times.
+  retries: 5
+  delay: 10
+  until: mm_up.rc == 0
+  changed_when: >-
+    ('Started' in mm_up.stderr) or ('Created' in mm_up.stderr)
+    or ('Recreated' in mm_up.stderr) or ('Pulling' in mm_up.stderr)
+  when: mm_enable
+
+- name: Wait for Mattermost to answer on its port
+  ansible.builtin.wait_for:
+    host: 127.0.0.1
+    port: "{{ mm_port }}"
+    timeout: 180
+  when: mm_enable
+
+- name: Show the Mattermost URL
+  ansible.builtin.debug:
+    msg: >-
+      Mattermost at {{ mm_site_url }} — first visit creates the admin account.
+      Then: System Console → Integrations → enable Bot Accounts, create a bot,
+      and give hermes its token.

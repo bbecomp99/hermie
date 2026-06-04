@@ -1,0 +1,23 @@
+---
+gateway_enable: true
+
+# hermes -> mattermost connection (same host, so localhost is simplest/robust).
+mm_connect_url: "http://127.0.0.1:8065"
+
+# Lock the bot down: comma-separated Mattermost usernames allowed to talk to it.
+# Empty + allow_all=false means it only responds where it's a member and
+# mentioned (config mattermost.require_mention: true). Set to your username.
+mm_allowed_users: ""
+mm_allow_all_users: false
+
+# Home channel: where hermes delivers cron results / autonomous messages.
+# Mattermost channel ID (not name). Empty = unset.
+mm_home_channel: ""
+mm_home_channel_name: "Home"
+
+# mm_bot_token comes from group_vars/hermes/vault.yml (gitignored).
+
+gateway_service_name: "hermes-gateway"
+hermes_home: "{{ ansible_env.HOME }}/.hermes"
+hermes_dir: "{{ hermes_home }}/hermes-agent"
+hermes_local_bin: "{{ ansible_env.HOME }}/.local/bin"

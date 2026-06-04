@@ -1,0 +1,34 @@
+# {{ ansible_managed }}
+services:
+  postgres:
+    image: {{ mm_pg_image }}
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: {{ mm_db_user }}
+      POSTGRES_PASSWORD: {{ mm_db_password }}
+      POSTGRES_DB: {{ mm_db_name }}
+    volumes:
+      - {{ mm_dir }}/volumes/postgres:/var/lib/postgresql/data
+    # Not published to the host — only reachable by the mattermost container.
+
+  mattermost:
+    image: mattermost/mattermost-team-edition:{{ mm_version }}
+    restart: unless-stopped
+    depends_on:
+      - postgres
+    ports:
+      - "{{ mm_bind }}:{{ mm_port }}:8065"
+    environment:
+      MM_SQLSETTINGS_DRIVERNAME: postgres
+      MM_SQLSETTINGS_DATASOURCE: "postgres://{{ mm_db_user }}:{{ mm_db_password }}@postgres:5432/{{ mm_db_name }}?sslmode=disable&connect_timeout=10"
+      MM_SERVICESETTINGS_SITEURL: "{{ mm_site_url }}"
+      # Allow bot accounts + personal access tokens (hermes auths via a bot token).
+      MM_SERVICESETTINGS_ENABLEBOTACCOUNTCREATION: "true"
+      MM_SERVICESETTINGS_ENABLEUSERACCESSTOKENS: "true"
+    volumes:
+      - {{ mm_dir }}/volumes/app/config:/mattermost/config
+      - {{ mm_dir }}/volumes/app/data:/mattermost/data
+      - {{ mm_dir }}/volumes/app/logs:/mattermost/logs
+      - {{ mm_dir }}/volumes/app/plugins:/mattermost/plugins
+      - {{ mm_dir }}/volumes/app/client-plugins:/mattermost/client/plugins
+      - {{ mm_dir }}/volumes/app/bleve-indexes:/mattermost/bleve-indexes

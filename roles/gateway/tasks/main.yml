@@ -1,0 +1,89 @@
+---
+- name: Assert the Mattermost bot token is provided
+  ansible.builtin.assert:
+    that: mm_bot_token is defined and (mm_bot_token | length) > 0
+    fail_msg: "mm_bot_token missing — add it to group_vars/hermes/vault.yml (gitignored)."
+
+- name: Get the login uid (for the user systemd runtime dir)
+  ansible.builtin.command: id -u
+  register: uid_cmd
+  changed_when: false
+
+- name: Configure the Mattermost channel in hermes' .env
+  ansible.builtin.blockinfile:
+    path: "{{ hermes_home }}/.env"
+    create: true
+    mode: "0600"
+    marker: "# {mark} ANSIBLE MATTERMOST (managed)"
+    block: |
+      MATTERMOST_URL={{ mm_connect_url }}
+      MATTERMOST_TOKEN={{ mm_bot_token }}
+      {% if mm_allowed_users | length > 0 %}
+      MATTERMOST_ALLOWED_USERS={{ mm_allowed_users }}
+      {% endif %}
+      {% if mm_allow_all_users %}
+      MATTERMOST_ALLOW_ALL_USERS=true
+      {% endif %}
+      {% if mm_home_channel | length > 0 %}
+      MATTERMOST_HOME_CHANNEL={{ mm_home_channel }}
+      MATTERMOST_HOME_CHANNEL_NAME={{ mm_home_channel_name }}
+      {% endif %}
+  no_log: true                       # contains the bot token
+  notify: Restart hermes gateway
+
+# hermes manages its OWN systemd unit ({{ gateway_service_name }}.service) and
+# even rewrites it on startup (`gateway run --replace`), so we let its installer
+# own the unit rather than templating our own. The installer is interactive
+# (two Y/n prompts: start-now, start-on-boot) — feed both with stdin. Only run
+# it when the unit is missing, to stay idempotent.
+- name: Check whether the gateway unit is already installed
+  ansible.builtin.stat:
+    path: "{{ ansible_env.HOME }}/.config/systemd/user/{{ gateway_service_name }}.service"
+  register: gw_unit
+
+- name: Install the gateway service (hermes-managed, non-interactive)
+  ansible.builtin.shell: |
+    set -o pipefail
+    printf 'y\ny\n' | "{{ hermes_dir }}/venv/bin/hermes" gateway install
+  args:
+    executable: /bin/bash
+  environment: &user_systemd_env
+    PATH: "{{ hermes_local_bin }}:/usr/local/bin:/usr/bin:/bin"
+    XDG_RUNTIME_DIR: "/run/user/{{ uid_cmd.stdout }}"
+    DBUS_SESSION_BUS_ADDRESS: "unix:path=/run/user/{{ uid_cmd.stdout }}/bus"
+  when: not gw_unit.stat.exists
+  changed_when: true
+
+- name: Enable and (re)start the gateway service
+  ansible.builtin.systemd:
+    name: "{{ gateway_service_name }}"
+    scope: user
+    enabled: "{{ gateway_enable }}"
+    state: started
+  environment: *user_systemd_env
+
+- name: Flush handlers so a .env change restarts the gateway now
+  ansible.builtin.meta: flush_handlers
+
+# hermes logs to ~/.hermes/logs/gateway.log (not stdout/journald). The last
+# connect/disconnect line reflects the current Mattermost state.
+- name: Confirm the gateway is connected to Mattermost
+  ansible.builtin.shell: >-
+    set -o pipefail;
+    grep -aE 'mattermost (connected|disconnected)' {{ hermes_home }}/logs/gateway.log
+    | tail -1
+  args:
+    executable: /bin/bash
+  register: mm_conn
+  changed_when: false
+  failed_when: false
+  retries: 12
+  delay: 5
+  until: "'mattermost connected' in mm_conn.stdout"
+  when: gateway_enable
+
+- name: Report gateway state
+  ansible.builtin.debug:
+    msg: >-
+      hermes-gateway: {{ 'Mattermost CONNECTED' if ('mattermost connected' in (mm_conn.stdout | default('')))
+      else 'started but connection unconfirmed (check ~/.hermes/logs/gateway.log)' }}
