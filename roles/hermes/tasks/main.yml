@@ -1,0 +1,104 @@
+---
+- name: Assert this is a Linux host
+  ansible.builtin.assert:
+    that: ansible_facts['system'] == 'Linux'
+    fail_msg: "This role targets the Linux agent host. Detected {{ ansible_facts['system'] }}."
+
+- name: Install OS prerequisites (needs sudo)
+  become: true
+  ansible.builtin.apt:
+    name:
+      - git
+      - curl
+      - ca-certificates
+      - build-essential
+    state: present
+    update_cache: true
+  when: ansible_facts['pkg_mgr'] == 'apt'
+
+- name: Install uv (user-level, no sudo)
+  ansible.builtin.shell: |
+    set -o pipefail
+    curl -LsSf https://astral.sh/uv/install.sh | sh
+  args:
+    executable: /bin/bash
+    creates: "{{ hermes_local_bin }}/uv"
+
+- name: Clone / update the hermes-agent repo
+  ansible.builtin.git:
+    repo: "{{ hermes_repo }}"
+    dest: "{{ hermes_dir }}"
+    version: "{{ hermes_version }}"
+    update: true
+  register: hermes_git
+
+- name: Create the uv venv
+  ansible.builtin.command:
+    cmd: "{{ hermes_local_bin }}/uv venv venv --python {{ hermes_python_version }}"
+    chdir: "{{ hermes_dir }}"
+    creates: "{{ hermes_dir }}/venv/bin/python"
+
+- name: Sync dependencies (hash-verified via uv.lock)
+  ansible.builtin.command:
+    cmd: "{{ hermes_local_bin }}/uv sync --extra {{ hermes_install_extras }} --locked"
+    chdir: "{{ hermes_dir }}"
+  environment:
+    UV_PROJECT_ENVIRONMENT: "{{ hermes_dir }}/venv"
+    UV_NO_CONFIG: "1"
+  register: uv_sync
+  changed_when: >-
+    ('Installed' in uv_sync.stderr) or ('Prepared' in uv_sync.stderr)
+    or ('Installed' in uv_sync.stdout)
+
+- name: Ensure ~/.local/bin exists
+  ansible.builtin.file:
+    path: "{{ hermes_local_bin }}"
+    state: directory
+
+# Upstream setup-hermes.sh symlinks the CLI here too; force replaces any
+# pre-existing launcher (e.g. a wrapper script) with the canonical symlink.
+- name: Symlink the hermes CLI onto PATH
+  ansible.builtin.file:
+    src: "{{ hermes_dir }}/venv/bin/hermes"
+    dest: "{{ hermes_local_bin }}/hermes"
+    state: link
+    force: true
+
+- name: Ensure ~/.local/bin is on PATH for interactive shells
+  ansible.builtin.lineinfile:
+    path: "{{ ansible_env.HOME }}/.bashrc"
+    line: 'export PATH="$HOME/.local/bin:$PATH"'
+    # Exact-match the managed line only, so we never clobber other
+    # .local/bin lines (e.g. uv's `. "$HOME/.local/bin/env"`).
+    regexp: '^export PATH="\$HOME/\.local/bin:\$PATH"$'
+    create: true
+    mode: "0644"
+
+# --- Configure the LLM target in config.yaml -------------------------------
+- name: Deploy the config patcher
+  ansible.builtin.template:
+    src: set_model.py.j2
+    dest: "{{ hermes_home }}/.ansible_set_model.py"
+    mode: "0700"
+  when: hermes_manage_config
+
+- name: "Point hermes at the LLM (model block in config.yaml)"
+  ansible.builtin.command:
+    cmd: "{{ hermes_dir }}/venv/bin/python {{ hermes_home }}/.ansible_set_model.py"
+  register: set_model
+  # NB: exact match — 'CHANGED' is a substring of 'UNCHANGED'.
+  changed_when: set_model.stdout == "CHANGED"
+  when: hermes_manage_config
+
+- name: Report hermes version
+  ansible.builtin.command:
+    cmd: "{{ hermes_dir }}/venv/bin/hermes --version"
+  register: hermes_version_out
+  changed_when: false
+  failed_when: false
+
+- name: Show result
+  ansible.builtin.debug:
+    msg: >-
+      hermes {{ hermes_version_out.stdout | default('(version check failed)') | trim }}
+      — LLM target {{ hermes_model_base_url }} ({{ hermes_model_default }})

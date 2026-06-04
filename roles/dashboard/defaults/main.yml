@@ -1,0 +1,8 @@
+---
+dashboard_service_name: "hermes-dashboard"
+dashboard_enable: true          # enable + start the service (and at boot)
+
+# Reuse the hermes role's paths.
+hermes_home: "{{ ansible_env.HOME }}/.hermes"
+hermes_dir: "{{ hermes_home }}/hermes-agent"
+hermes_local_bin: "{{ ansible_env.HOME }}/.local/bin"

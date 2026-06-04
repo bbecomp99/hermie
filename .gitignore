@@ -1,0 +1,13 @@
+# Secrets — never commit
+.env
+.env.*
+*.pem
+*.key
+id_rsa*
+
+# Ansible
+*.retry
+.vault_pass
+vault_pass.txt
+inventory/hosts.yml
+group_vars/*/vault.yml

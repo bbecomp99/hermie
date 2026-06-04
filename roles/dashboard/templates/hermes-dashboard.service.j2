@@ -1,0 +1,18 @@
+# {{ ansible_managed }}
+[Unit]
+Description=Hermes Agent web dashboard
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory={{ hermes_dir }}
+# node/npm/uv/hermes all live in ~/.local/bin.
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart={{ hermes_dir }}/venv/bin/hermes dashboard --host {{ dashboard_host }} --port {{ dashboard_port }} --no-open --skip-build{% if dashboard_insecure %} --insecure{% endif %}{% if dashboard_tui %} --tui{% endif %}
+
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

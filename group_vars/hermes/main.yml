@@ -1,0 +1,21 @@
+---
+# --- Hermes agent source (NousResearch/hermes-agent) ---
+hermes_repo: "https://github.com/NousResearch/hermes-agent.git"
+hermes_version: "a6e47314f98cccb09f302ad649d8bec30e4b4a2d"  # pinned to the running commit; bump deliberately
+
+# --- LLM target ---
+# The agent talks to the MLX server running on the Mac (192.168.88.127:8080)
+# over the OpenAI-compatible API. These three keys are written into the
+# `model:` block of ~/.hermes/config.yaml.
+hermes_model_default: "mlx-community/DeepSeek-R1-Distill-Qwen-7B-4bit"
+hermes_model_provider: "custom"
+hermes_model_base_url: "http://192.168.88.127:8080/v1"
+
+# --- Web dashboard (always-on systemd service) ---
+# LAN-exposed (--insecure) on a trusted home network, same trust model as the
+# MLX server. WARNING: the dashboard manages API keys/config — only bind to a
+# non-localhost address on a network you fully trust.
+dashboard_host: "0.0.0.0"
+dashboard_port: 9119
+dashboard_insecure: true        # required to bind off-localhost
+dashboard_tui: true             # in-browser Chat tab (talk to the agent)

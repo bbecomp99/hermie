@@ -1,0 +1,18 @@
+# Copy to inventory/hosts.yml and fill in the agent host's details.
+# The real hosts.yml is gitignored.
+all:
+  children:
+    hermes:
+      hosts:
+        agent:
+          ansible_host: 192.168.88.128       # the Hermes agent box (Ubuntu)
+          ansible_user: pinky                 # SSH login user (has sudo)
+          ansible_port: 22
+
+          # --- auth (pick ONE) ---
+          # Preferred: SSH key (run `ssh-copy-id pinky@192.168.88.128` once).
+          ansible_ssh_private_key_file: ~/.ssh/id_ed25519
+
+          # Password auth instead: requires `sshpass` locally, then run with
+          #   ansible-playbook playbook.yml --ask-pass --ask-become-pass
+          # (the sudo/become password is the same as the SSH password).

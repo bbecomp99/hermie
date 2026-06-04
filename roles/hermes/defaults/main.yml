@@ -1,0 +1,13 @@
+---
+# Where hermes keeps its data/config, and where the repo lives.
+hermes_home: "{{ ansible_env.HOME }}/.hermes"
+hermes_dir: "{{ hermes_home }}/hermes-agent"
+hermes_local_bin: "{{ ansible_env.HOME }}/.local/bin"
+
+# Python / dependency install.
+hermes_python_version: "3.11"
+hermes_install_extras: "all"     # -> uv sync --extra all
+
+# Write the model: block of config.yaml to point at the LLM. Set false to
+# leave hermes' own config untouched and only manage the install.
+hermes_manage_config: true

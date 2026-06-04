@@ -1,0 +1,8 @@
+---
+- name: Deploy and configure the Hermes agent
+  hosts: hermes
+  gather_facts: true
+
+  roles:
+    - hermes
+    - dashboard

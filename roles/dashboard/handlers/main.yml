@@ -1,0 +1,11 @@
+---
+- name: Restart hermes-dashboard
+  ansible.builtin.systemd:
+    name: "{{ dashboard_service_name }}"
+    scope: user
+    state: restarted
+    daemon_reload: true
+  environment:
+    XDG_RUNTIME_DIR: "/run/user/{{ uid_cmd.stdout }}"
+    DBUS_SESSION_BUS_ADDRESS: "unix:path=/run/user/{{ uid_cmd.stdout }}/bus"
+  when: dashboard_enable

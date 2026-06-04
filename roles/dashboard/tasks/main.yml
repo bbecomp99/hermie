@@ -1,0 +1,56 @@
+---
+- name: Get the login uid (for the user systemd runtime dir)
+  ansible.builtin.command: id -u
+  register: uid_cmd
+  changed_when: false
+
+- name: Enable systemd linger so the user service runs at boot (needs sudo)
+  become: true
+  ansible.builtin.command: "loginctl enable-linger {{ ansible_user }}"
+  args:
+    creates: "/var/lib/systemd/linger/{{ ansible_user }}"
+
+- name: Build the dashboard web UI (first run / when missing)
+  ansible.builtin.command:
+    cmd: npm run build
+    chdir: "{{ hermes_dir }}/web"
+    creates: "{{ hermes_dir }}/hermes_cli/web_dist/index.html"
+  environment:
+    PATH: "{{ hermes_local_bin }}:/usr/local/bin:/usr/bin:/bin"
+
+- name: Ensure the user systemd unit directory exists
+  ansible.builtin.file:
+    path: "{{ ansible_env.HOME }}/.config/systemd/user"
+    state: directory
+    mode: "0755"
+
+- name: Deploy the dashboard systemd unit
+  ansible.builtin.template:
+    src: hermes-dashboard.service.j2
+    dest: "{{ ansible_env.HOME }}/.config/systemd/user/{{ dashboard_service_name }}.service"
+    mode: "0644"
+  notify: Restart hermes-dashboard
+
+- name: Enable and start the dashboard service
+  ansible.builtin.systemd:
+    name: "{{ dashboard_service_name }}"
+    scope: user
+    enabled: "{{ dashboard_enable }}"
+    state: started
+    daemon_reload: true
+  environment:
+    XDG_RUNTIME_DIR: "/run/user/{{ uid_cmd.stdout }}"
+    DBUS_SESSION_BUS_ADDRESS: "unix:path=/run/user/{{ uid_cmd.stdout }}/bus"
+
+- name: Wait for the dashboard to start listening
+  ansible.builtin.wait_for:
+    host: 127.0.0.1
+    port: "{{ dashboard_port }}"
+    timeout: 120
+  when: dashboard_enable
+
+- name: Show the dashboard URL
+  ansible.builtin.debug:
+    msg: >-
+      Dashboard live at http://{{ ansible_default_ipv4.address | default(ansible_host) }}:{{ dashboard_port }}
+      (LAN{{ ' --insecure' if dashboard_insecure else '' }}{{ ', chat tab on' if dashboard_tui else '' }})

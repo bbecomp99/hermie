@@ -1,0 +1,40 @@
+#!/usr/bin/env python3
+# {{ ansible_managed }}
+# Idempotently set ONLY the model: block of ~/.hermes/config.yaml, leaving
+# every other setting (and API keys) untouched. Prints CHANGED / UNCHANGED
+# so Ansible can report accurate change state.
+import os
+import shutil
+
+import yaml
+
+CONFIG = os.path.expanduser("~/.hermes/config.yaml")
+
+desired = {
+    "default": {{ hermes_model_default | to_json }},
+    "provider": {{ hermes_model_provider | to_json }},
+    "base_url": {{ hermes_model_base_url | to_json }},
+}
+
+data = {}
+if os.path.exists(CONFIG):
+    with open(CONFIG) as f:
+        data = yaml.safe_load(f) or {}
+
+model = data.get("model") or {}
+changed = any(model.get(k) != v for k, v in desired.items())
+
+if changed:
+    model.update(desired)
+    data["model"] = model
+    if os.path.exists(CONFIG):
+        shutil.copy2(CONFIG, CONFIG + ".bak.ansible")
+    # Write to a temp file then replace, so a crash can't truncate the config.
+    tmp = CONFIG + ".tmp"
+    with open(tmp, "w") as f:
+        yaml.safe_dump(data, f, default_flow_style=False, sort_keys=False)
+    os.replace(tmp, CONFIG)
+    os.chmod(CONFIG, 0o600)
+    print("CHANGED")
+else:
+    print("UNCHANGED")
