@@ -11,3 +11,7 @@ id_rsa*
 vault_pass.txt
 inventory/hosts.yml
 group_vars/*/vault.yml
+
+# Runtime artifacts (out-of-scope ai-serve process state — churns every run)
+ai-serve/serve.log
+ai-serve/serve.pid

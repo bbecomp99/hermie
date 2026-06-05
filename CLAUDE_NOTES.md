@@ -107,7 +107,65 @@ remote host, pointed at a local MLX LLM. It is *not* application code.
 - **End-to-end chat CONFIRMED (2026-06-04):** DM to @hermie → gateway authorized
   brian → LLM call to DeepSeek-R1 (.127:8080, ~14s) → 398-char reply delivered
   back to Mattermost. The full path works.
+
+- **DONE — daily weather cron to Town Square (built+verified 2026-06-05):**
+  Job **`weather-daily`** (id `f9bea473519f`), schedule `0 7 * * *` = **7:00 AM
+  Central** (box TZ confirmed **CDT**). Home channel = Town Square
+  `bkkf739saif5tgzwaynhikgmho`. Cities: Dallas TX, Glen Haven WI, Billings MT,
+  Miami FL — current + today + next 2 days.
+  - **Architecture = script does EVERYTHING (`--no-agent`, no LLM).**
+    `--script weather.py` (`~/.hermes/scripts/weather.py`, stdlib-only Python)
+    fetches REAL data from **Open-Meteo** (no API key, hardcoded lat/long per
+    city so tiny Glen Haven resolves right; WMO code→text + emoji map; °F),
+    formats a polished Mattermost message (`##` header + per-city bold line +
+    a 3-row markdown table Day/Forecast/Hi-Lo/Rain), and **posts it itself**
+    via the Mattermost API (creds read from `~/.hermes/.env`:
+    `MATTERMOST_URL`/`TOKEN`/`HOME_CHANNEL`).
+  - **Why self-post instead of cron delivery:** cron's own delivery prepends a
+    `Cronjob Response: <name> (job_id…)` header and appends a `To stop or manage
+    this job…` footer — ugly. With `--no-agent`, **empty stdout = cron stays
+    silent**, so the script posts directly and prints nothing → clean message,
+    no wrapper. On post failure the script prints the message instead, so cron
+    delivers it (wrapped) as a visible fallback rather than losing it.
+    Test manually with `python3 ~/.hermes/scripts/weather.py --print` (formats
+    only, no delivery) vs no args (live post).
+  - Evolution this session: v1 agent-formatted (script stdout injected, LLM
+    prettifies) worked but the LLM added greeting/sign-off chatter and the
+    format drifted → switched to v2 deterministic self-posting script. The
+    earlier note about "agent only formats" is superseded.
+  - ⚠️ **WHY not pure-LLM:** first attempt was a plain prompt telling Hermes to
+    fetch weather via its `web` tool. The run logged **`tool_turns=0`** — the
+    7B-4bit distill NEVER called a tool, it fabricated every temp and got the
+    weekdays internally inconsistent. Small distilled reasoning models "think +
+    answer" instead of tool-calling. So real data MUST be injected, not fetched
+    by the model. (User picked pure-LLM first, then chose script-grounded after
+    seeing the fabrication evidence.)
+  - **Cron mechanics learned:** `hermes cron create '<sched>' '<prompt>'
+    [--name N] [--deliver mattermost|platform:chat_id] [--script F] [--no-agent]`.
+    `--script` files live under `~/.hermes/scripts/`; `.sh/.bash` run via bash,
+    everything else via Python; default mode injects stdout into the prompt,
+    `--no-agent` delivers stdout verbatim. Force a test run NOW with
+    `hermes cron run <id>` then `hermes cron tick` (tick executes due jobs once).
+    The **gateway** runs the scheduler (`hermes cron status` shows it). Delivery
+    target `mattermost` (bare) = the configured `MATTERMOST_HOME_CHANNEL`.
+  - **`hermes send`** (no LLM) is the easy way to post to MM from a script/CI:
+    `hermes send --to mattermost "msg"` / `--list mattermost` shows targets.
+  - Minor: box `.env` has a deprecated `TERMINAL_CWD=/home/pinky` (warns on each
+    cron tick; harmless — move to `config.yaml terminal.cwd` someday).
+
+- **.128 back UP (2026-06-05):** the earlier "down/powered-off" blocker cleared —
+  ping 0% loss, keyless SSH works, both user units `active` (hermes-gateway,
+  hermes-dashboard), MLX on .127:8080 serving. Hermes now `v0.15.1`, 238 commits
+  behind upstream (still pinned deliberately).
+
+- **ai-serve note (2026-06-05):** `serve.sh` MODEL line was switched to
+  `mlx-community/Qwen2.5-Coder-3B-Instruct-4bit` (lines 10-11 are now two
+  identical lines — commented fallback == active, comment is redundant). But the
+  server actually running serves DeepSeek-R1 (+ Qwens). `serve.log`/`serve.pid`
+  are tracked but are runtime artifacts — consider gitignoring them.
+
 - **Autonomy (requested, not built):** `hermes cron` / `hermes goals` (the
-  gateway already runs the cron scheduler). Needs a concrete unattended task.
+  gateway already runs the cron scheduler). The weather job above is the first
+  concrete unattended task.
 - Offered but not done: reverse-proxy/Tailscale if dashboard/Mattermost ever
   need real internet exposure (currently LAN-only).
