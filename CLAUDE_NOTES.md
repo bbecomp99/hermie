@@ -133,6 +133,16 @@ remote host, pointed at a local MLX LLM. It is *not* application code.
     prettifies) worked but the LLM added greeting/sign-off chatter and the
     format drifted → switched to v2 deterministic self-posting script. The
     earlier note about "agent only formats" is superseded.
+  - **Now captured as an Ansible role — reproducible.** `roles/weather`
+    (tagged `weather`) templates the script (`weather.py.j2`, cities/coords/
+    schedule in `roles/weather/defaults/main.yml`) and registers the cron job
+    idempotently (guards on the job name in `hermes cron list`; uses argv form
+    so the `0 7 * * *` schedule isn't split). Added after `gateway` in
+    `playbook.yml` (the script needs the MATTERMOST_* that gateway writes to
+    `.env`). Runs as the login user — **no become / no vault** needed. Apply
+    just this slice: `ansible-playbook playbook.yml --tags weather`. Verified
+    idempotent (`changed=0` on re-run). To change schedule/flags:
+    `hermes cron remove <id>` on the box, then re-run the play.
   - ⚠️ **WHY not pure-LLM:** first attempt was a plain prompt telling Hermes to
     fetch weather via its `web` tool. The run logged **`tool_turns=0`** — the
     7B-4bit distill NEVER called a tool, it fabricated every temp and got the

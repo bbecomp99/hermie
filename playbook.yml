@@ -8,3 +8,4 @@
     - dashboard
     - mattermost
     - gateway
+    - { role: weather, tags: ['weather'] }

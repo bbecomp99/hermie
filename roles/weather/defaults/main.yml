@@ -1,0 +1,25 @@
+---
+# Daily weather forecast cron job. A self-contained Python script fetches REAL
+# data from Open-Meteo (no API key) and posts a formatted forecast straight to
+# the Mattermost home channel; the cron job runs it with --no-agent (no LLM, so
+# no fabrication and no "Cronjob Response" wrapper). See roles/weather/README
+# notes in CLAUDE_NOTES.md for the why.
+
+weather_job_name: "weather-daily"
+weather_schedule: "0 7 * * *"        # 7:00 AM box-local time (box TZ = CDT)
+weather_forecast_days: 3             # today + next 2 days
+
+# Cities to report. Coords are hardcoded so tiny places (e.g. Glen Haven, WI)
+# resolve correctly instead of being mis-geocoded.
+weather_cities:
+  - { name: "Dallas, TX",     lat: 32.7767,  lon: -96.7970 }
+  - { name: "Glen Haven, WI", lat: 42.7039,  lon: -91.0035 }
+  - { name: "Billings, MT",   lat: 45.7833,  lon: -108.5007 }
+  - { name: "Miami, FL",      lat: 25.7617,  lon: -80.1918 }
+
+# Paths (match the hermes/gateway roles).
+hermes_home: "{{ ansible_env.HOME }}/.hermes"
+hermes_dir: "{{ hermes_home }}/hermes-agent"
+hermes_local_bin: "{{ ansible_env.HOME }}/.local/bin"
+weather_scripts_dir: "{{ hermes_home }}/scripts"
+weather_script_name: "weather.py"

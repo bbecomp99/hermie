@@ -1,0 +1,105 @@
+#!/usr/bin/env python3
+# {{ ansible_managed }}
+"""Daily weather post for the Mattermost home channel. Fetches REAL 3-day
+forecasts (today + next N) for a fixed set of cities from Open-Meteo (no API
+key), formats a polished Mattermost message, and posts it directly to the home
+channel using creds in ~/.hermes/.env (written by the gateway role).
+
+Run via `hermes cron` with --no-agent: on success it prints nothing (cron stays
+silent -> no 'Cronjob Response' wrapper); on failure it prints the message so
+cron delivers it as a visible fallback. Pass --print to format-and-print only.
+
+Managed by Ansible (roles/weather) — edit the template, not the deployed file."""
+import json, os, sys, urllib.request, urllib.parse
+from datetime import datetime
+
+CITIES = [
+{% for c in weather_cities %}
+    ("{{ c.name }}", {{ c.lat }}, {{ c.lon }}),
+{% endfor %}
+]
+FORECAST_DAYS = {{ weather_forecast_days }}
+
+WMO = {
+    0:"Clear sky",1:"Mainly clear",2:"Partly cloudy",3:"Overcast",
+    45:"Fog",48:"Rime fog",51:"Light drizzle",53:"Drizzle",55:"Dense drizzle",
+    56:"Freezing drizzle",57:"Freezing drizzle",61:"Slight rain",63:"Rain",
+    65:"Heavy rain",66:"Freezing rain",67:"Heavy freezing rain",71:"Slight snow",
+    73:"Snow",75:"Heavy snow",77:"Snow grains",80:"Rain showers",
+    81:"Rain showers",82:"Violent rain showers",85:"Snow showers",
+    86:"Heavy snow showers",95:"Thunderstorm",96:"Thunderstorm w/ hail",
+    99:"Thunderstorm w/ heavy hail",
+}
+def desc(c): return WMO.get(c, f"code {c}")
+def icon(c):
+    if c == 0: return "☀️"
+    if c in (1,2): return "\U0001f324️"
+    if c == 3: return "☁️"
+    if c in (45,48): return "\U0001f32b️"
+    if c in (51,53,55,56,57,61,80): return "\U0001f326️"
+    if c in (63,65,66,67,81,82): return "\U0001f327️"
+    if c in (71,73,75,77,85,86): return "\U0001f328️"
+    if c in (95,96,99): return "⛈️"
+    return "\U0001f321️"
+
+def fetch(lat, lon):
+    q = urllib.parse.urlencode({
+        "latitude": lat, "longitude": lon,
+        "current": "temperature_2m,weather_code",
+        "daily": "weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max",
+        "temperature_unit": "fahrenheit", "timezone": "auto", "forecast_days": FORECAST_DAYS,
+    })
+    with urllib.request.urlopen("https://api.open-meteo.com/v1/forecast?" + q, timeout=15) as r:
+        return json.load(r)
+
+def build():
+    out = [f"## \U0001f305 Daily Weather — {datetime.now().strftime('%A, %B %-d, %Y')}"]
+    for name, lat, lon in CITIES:
+        try:
+            d = fetch(lat, lon); cur = d["current"]; dy = d["daily"]
+            out.append(f"\n**\U0001f4cd {name}** — now **{round(cur['temperature_2m'])}°F**, "
+                       f"{icon(cur['weather_code'])} {desc(cur['weather_code'])}\n")
+            out.append("| Day | Forecast | Hi / Lo | Rain |")
+            out.append("|:--|:--|--:|--:|")
+            for i in range(len(dy["time"])):
+                day = datetime.strptime(dy["time"][i], "%Y-%m-%d").strftime("%a %-m/%-d")
+                hi = round(dy["temperature_2m_max"][i]); lo = round(dy["temperature_2m_min"][i])
+                c = dy["weather_code"][i]
+                pp = dy["precipitation_probability_max"][i]
+                pp = f"{pp}%" if pp is not None else "—"
+                out.append(f"| {day} | {icon(c)} {desc(c)} | {hi}° / {lo}° | {pp} |")
+        except Exception as e:
+            out.append(f"\n**\U0001f4cd {name}** — _data unavailable ({type(e).__name__})_")
+    return "\n".join(out)
+
+def load_env(path):
+    env = {}
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            env[k.strip()] = v.strip().strip('"').strip("'")
+    return env
+
+def post(msg):
+    env = load_env(os.path.expanduser("~/.hermes/.env"))
+    url = env["MATTERMOST_URL"].rstrip("/")
+    chan = env["MATTERMOST_HOME_CHANNEL"]
+    body = json.dumps({"channel_id": chan, "message": msg}).encode()
+    req = urllib.request.Request(url + "/api/v4/posts", data=body, method="POST",
+        headers={"Authorization": "Bearer " + env["MATTERMOST_TOKEN"],
+                 "Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=15) as r:
+        return r.status
+
+msg = build()
+if "--print" in sys.argv:
+    print(msg)
+else:
+    try:
+        post(msg)          # success -> no stdout -> cron silent (no wrapper)
+    except Exception as e:
+        print(msg)         # fallback: let cron deliver it (wrapped) so it is not lost
+        sys.stderr.write(f"direct post failed, fell back to cron delivery: {e}\n")

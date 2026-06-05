@@ -1,0 +1,55 @@
+---
+# Deploys the weather forecast script and registers the daily cron job.
+# Depends on the gateway role having written MATTERMOST_* into ~/.hermes/.env
+# (the script reads those creds to self-post). Runs entirely as the login user —
+# no become needed.
+
+- name: Ensure the hermes scripts dir exists
+  ansible.builtin.file:
+    path: "{{ weather_scripts_dir }}"
+    state: directory
+    mode: "0755"
+
+- name: Deploy the weather forecast script
+  ansible.builtin.template:
+    src: weather.py.j2
+    dest: "{{ weather_scripts_dir }}/{{ weather_script_name }}"
+    mode: "0755"
+
+- name: List existing cron jobs
+  ansible.builtin.command: "{{ hermes_dir }}/venv/bin/hermes cron list"
+  environment:
+    PATH: "{{ hermes_local_bin }}:/usr/local/bin:/usr/bin:/bin"
+  register: weather_cron_list
+  changed_when: false
+
+# hermes cron create has no built-in "upsert", so guard on the job name to stay
+# idempotent. To change the schedule/flags later, `hermes cron remove <id>` on
+# the box first, then re-run this play. The schedule must be ONE argv element
+# (it contains spaces) — use argv form so the command module doesn't split it.
+- name: Register the daily weather cron job (only if absent)
+  ansible.builtin.command:
+    argv:
+      - "{{ hermes_dir }}/venv/bin/hermes"
+      - cron
+      - create
+      - "{{ weather_schedule }}"
+      - "--name"
+      - "{{ weather_job_name }}"
+      - "--deliver"
+      - "mattermost"
+      - "--script"
+      - "{{ weather_script_name }}"
+      - "--no-agent"
+  environment:
+    PATH: "{{ hermes_local_bin }}:/usr/local/bin:/usr/bin:/bin"
+  when: weather_job_name not in weather_cron_list.stdout
+  changed_when: true
+
+- name: Report weather cron state
+  ansible.builtin.debug:
+    msg: >-
+      {{ weather_job_name }}:
+      {{ 'already registered (left as-is)' if weather_job_name in weather_cron_list.stdout
+         else 'created — schedule ' ~ weather_schedule }}
+      -> delivers to Mattermost home channel
