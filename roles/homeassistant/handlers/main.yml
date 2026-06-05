@@ -1,0 +1,13 @@
+---
+# Only fires if the compose file actually changes (e.g. image tag bump). With an
+# unchanged service spec, `docker compose up -d` reports the container
+# up-to-date and does not recreate it.
+- name: Reconcile home assistant container
+  become: true
+  ansible.builtin.command:
+    cmd: docker compose up -d
+    chdir: "{{ ha_compose_dir }}"
+  changed_when: >-
+    ('Started' in ha_reconcile.stderr) or ('Created' in ha_reconcile.stderr)
+    or ('Recreated' in ha_reconcile.stderr)
+  register: ha_reconcile

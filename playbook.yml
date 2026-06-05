@@ -8,4 +8,5 @@
     - dashboard
     - mattermost
     - gateway
+    - { role: homeassistant, tags: ['homeassistant', 'ha'] }
     - { role: weather, tags: ['weather'] }

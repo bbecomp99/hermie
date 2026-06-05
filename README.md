@@ -10,10 +10,16 @@ Ansible project to **deploy and configure the [Hermes agent](https://github.com/
                                                                      ▲
                                                                      │ OpenAI HTTP
   Agent 192.168.88.128  Hermes agent CLI (~/.hermes) ──────calls────┘
+                        + Mattermost (:8065) + Home Assistant (:8123), Docker
 ```
 
 This repo manages **only the agent side** (`.128`). The LLM on the Mac is
 already running and out of scope here.
+
+> The MLX box (`.127`) is also used by a separate project (**astonks**): its
+> hourly watcher posts to the `#stonks` Mattermost channel as bot **@stonkbot**
+> and calls the same LLM. Out of scope for this repo, but it shares this
+> Mattermost instance and the `.127:8080` model server.
 
 ## What the playbook does
 
@@ -27,8 +33,22 @@ On the agent host (Ubuntu, user `pinky`):
 6. Idempotently writes the `model:` block of `~/.hermes/config.yaml` to point at
    the LLM (backs up the file, leaves all other settings/keys untouched).
 
-It does **not** start a long-running service — hermes is a CLI you invoke
-(`hermes`, `hermes setup`, `hermes gateway`, `hermes cron`, …).
+## Roles (playbook order)
+
+The playbook now does more than install the CLI. Roles run in this order:
+
+| Role            | What it sets up |
+|-----------------|-----------------|
+| `hermes`        | The steps above — the agent CLI + `config.yaml` model block. |
+| `dashboard`     | `hermes dashboard` as a user systemd service `hermes-dashboard`, bound `0.0.0.0:9119` (LAN-only; uses `--insecure`). |
+| `mattermost`    | Self-hosted Mattermost (team edition) + Postgres via Docker Compose, `:8065`. |
+| `gateway`       | Wires the hermes Mattermost channel and runs the messaging gateway user service `hermes-gateway` (bot **@hermie**). |
+| `homeassistant` | Adopts the **existing** Home Assistant container on `.128` (non-disruptive — never touches the HA config/db), and enables the hermes `homeassistant` toolset so the agent can drive HA. |
+| `weather`       | Daily forecast cron delivered to Mattermost (`hermes cron`, script-grounded). |
+
+So beyond the CLI, `.128` ends up running long-running services:
+`hermes-dashboard` + `hermes-gateway` (user systemd) and the Mattermost + Home
+Assistant containers. The bare `hermes` CLI itself is still just invoked on demand.
 
 ## Prerequisites
 
@@ -62,3 +82,14 @@ ansible-playbook playbook.yml                        # apply
 
 Role toggles in `roles/hermes/defaults/main.yml`: `hermes_python_version`,
 `hermes_install_extras`, `hermes_manage_config`.
+
+### Secrets
+
+Secrets live in `group_vars/hermes/vault.yml` (gitignored; see
+`vault.yml.example` for the keys):
+
+| Variable        | Used by | Where to get it |
+|-----------------|---------|-----------------|
+| `mm_db_password`| mattermost | you choose it (Postgres password) |
+| `mm_bot_token`  | gateway | Mattermost → System Console → Integrations → Bot Accounts |
+| `hass_token`    | homeassistant | Home Assistant → Profile → Security → Long-Lived Access Tokens |

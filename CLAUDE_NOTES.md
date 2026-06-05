@@ -63,6 +63,30 @@ remote host, pointed at a local MLX LLM. It is *not* application code.
   CloudLogic). Channel IDs found via Mattermost API with the bot token:
   `curl -H "Authorization: Bearer $TOKEN" .../api/v4/teams/{id}/channels/name/town-square`.
 
+- **homeassistant role:** ADOPTS the already-running Home Assistant container on
+  `.128` (`ghcr.io/home-assistant/home-assistant:stable`, `network_mode: host`,
+  `:8123`, config bind-mounted at `/opt/homeassistant/config`). Deliberately
+  non-disruptive — the compose spec matches the running container so
+  `docker compose up -d` finds it up-to-date and does NOT recreate it, and the HA
+  config/db is never touched. Then wires hermes: writes `HASS_URL`/`HASS_TOKEN`
+  to `~/.hermes/.env` (`no_log`) and enables the hermes `homeassistant` toolset
+  so the agent can drive HA. Token = `hass_token` in vault (HA → Profile →
+  Security → Long-Lived Access Tokens). Compose dir `~/homeass`.
+
+- **weather role:** the daily forecast cron (see "Open / next") captured as a
+  reproducible role.
+
+## Cross-repo: astonks shares this stack
+- The **astonks** project (`~/reposdso/astonks`) runs its own hourly "watcher"
+  bot that **posts to this Mattermost** and **calls the same `.127:8080` MLX LLM**.
+- It uses a SEPARATE bot, **@stonkbot** (user id `iz34tkszatrt7pi5j74kz3fu6r`),
+  posting to a dedicated channel **#stonks** (`wx1br6bfat88xffn5johzhizmh`) in the
+  CloudLogic team — distinct from @hermie / Town Square. Onboarding gotcha learned
+  there: a MM bot must be added to the TEAM (System Console → User Management →
+  Teams) BEFORE it can be `/invite`d to a channel.
+- astonks pins model `Nous-Hermes-2-Mistral-7B-DPO-4bit-MLX` (cleaner prose than
+  DeepSeek-R1 for summaries). All four MLX models are served on `.127:8080`.
+
 ## Gotchas learned (don't repeat)
 - **hermes gateway: do NOT template your own systemd unit.** `hermes gateway run`
   REWRITES its own unit on startup (`--replace`), so a custom unit churns every
@@ -97,11 +121,13 @@ remote host, pointed at a local MLX LLM. It is *not* application code.
 - ⚠️ The dashboard exposes API keys on the LAN (why hermes requires `--insecure`).
   User accepted — trusted home LAN only; do NOT port-forward 9119 to the internet.
 
-## Git state
-- `main` pushed to `origin` (`github.com:bbecomp99/hermie.git`) through the
-  hermes+dashboard work (commit `a81881a`). **Uncommitted since then:** mattermost
-  role, gateway role, hermes git-skip guard, mm retries, vault.yml.example, and
-  notes updates. Commit/push when the user asks.
+## Git state (as of 2026-06-05)
+- `main` pushed to `origin` (`github.com:bbecomp99/hermie.git`), in sync. The
+  mattermost/gateway/AI-server/weather work is all committed
+  (`470f926`, `47f712b`, `cda623c`, `97e4f99`).
+- Latest commit adds the **homeassistant role** + playbook wiring +
+  `vault.yml.example` `hass_token` + README/notes refresh.
+- No PR to anywhere; `main` is the working branch.
 
 ## Open / next
 - **End-to-end chat CONFIRMED (2026-06-04):** DM to @hermie → gateway authorized

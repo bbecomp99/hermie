@@ -1,0 +1,22 @@
+---
+# Adopts the EXISTING Home Assistant docker container on .128 under Ansible and
+# wires Hermes to it. Deliberately non-disruptive: the HA config/database at
+# {{ ha_config_path }} is never touched, and the compose service spec matches
+# what is already running (same image tag) so `docker compose up -d` finds the
+# container up-to-date and does NOT recreate it.
+
+ha_compose_dir: "{{ ansible_env.HOME }}/homeass"        # where the compose file lives
+ha_image: "ghcr.io/home-assistant/home-assistant:stable"
+ha_config_path: "/opt/homeassistant/config"             # bind-mounted HA config (root-owned, left alone)
+ha_port: 8123
+ha_enable: true                                         # bring the container up
+
+# Hermes -> HA connection. Host-networked on the same box; resolves to the
+# box's LAN IP (the value already in ~/.hermes/.env), so this stays idempotent.
+hass_url: "http://{{ ansible_default_ipv4.address | default('127.0.0.1') }}:{{ ha_port }}"
+# hass_token comes from group_vars/hermes/vault.yml (gitignored).
+
+# Paths (match the hermes/gateway roles).
+hermes_home: "{{ ansible_env.HOME }}/.hermes"
+hermes_dir: "{{ hermes_home }}/hermes-agent"
+hermes_local_bin: "{{ ansible_env.HOME }}/.local/bin"

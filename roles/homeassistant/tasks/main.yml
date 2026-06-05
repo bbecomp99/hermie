@@ -1,0 +1,92 @@
+---
+# Phase 1: adopt the running Home Assistant container and wire Hermes to it.
+# Never touches {{ ha_config_path }} (the HA config/database).
+
+- name: Assert the HA long-lived token is provided
+  ansible.builtin.assert:
+    that: hass_token is defined and (hass_token | length) > 0
+    fail_msg: "hass_token missing — add it to group_vars/hermes/vault.yml (gitignored)."
+
+- name: Ensure docker is available
+  ansible.builtin.command: docker --version
+  changed_when: false
+
+- name: Ensure the HA compose project dir exists
+  ansible.builtin.file:
+    path: "{{ ha_compose_dir }}"
+    state: directory
+    mode: "0755"
+
+- name: Deploy the Home Assistant docker-compose.yaml (spec matches running container)
+  ansible.builtin.template:
+    src: docker-compose.yaml.j2
+    dest: "{{ ha_compose_dir }}/docker-compose.yaml"
+    mode: "0644"
+  notify: Reconcile home assistant container
+
+- name: Ensure the Home Assistant container is up
+  become: true
+  ansible.builtin.command:
+    cmd: docker compose up -d
+    chdir: "{{ ha_compose_dir }}"
+  register: ha_up
+  # .128 has flaky IPv6; an image pull can fail before Docker falls back to IPv4.
+  retries: 5
+  delay: 10
+  until: ha_up.rc == 0
+  changed_when: >-
+    ('Started' in ha_up.stderr) or ('Created' in ha_up.stderr)
+    or ('Recreated' in ha_up.stderr) or ('Pulling' in ha_up.stderr)
+  when: ha_enable
+
+- name: Wait for Home Assistant to answer on its port
+  ansible.builtin.wait_for:
+    host: 127.0.0.1
+    port: "{{ ha_port }}"
+    timeout: 120
+  when: ha_enable
+
+# --- Hermes <-> HA wiring (so a rebuild restores the integration) ---
+# Edit the two HASS_* keys in place rather than a managed block, since they were
+# originally added as plain top-level lines — avoids duplicates.
+- name: Point hermes at Home Assistant (HASS_URL)
+  ansible.builtin.lineinfile:
+    path: "{{ hermes_home }}/.env"
+    create: true
+    mode: "0600"
+    regexp: '^HASS_URL='
+    line: "HASS_URL={{ hass_url }}"
+
+- name: Give hermes the HA long-lived token (HASS_TOKEN)
+  ansible.builtin.lineinfile:
+    path: "{{ hermes_home }}/.env"
+    create: true
+    mode: "0600"
+    regexp: '^HASS_TOKEN='
+    line: "HASS_TOKEN={{ hass_token }}"
+  no_log: true                       # contains the token
+
+- name: Check whether the homeassistant toolset is enabled
+  ansible.builtin.shell: |
+    set -o pipefail
+    {{ hermes_dir }}/venv/bin/hermes tools list | grep -i homeassistant | grep -q enabled \
+      && echo ENABLED || echo DISABLED
+  args:
+    executable: /bin/bash
+  environment:
+    PATH: "{{ hermes_local_bin }}:/usr/local/bin:/usr/bin:/bin"
+  register: ha_toolset
+  changed_when: false
+
+- name: Enable the homeassistant toolset if needed
+  ansible.builtin.command: "{{ hermes_dir }}/venv/bin/hermes tools enable homeassistant"
+  environment:
+    PATH: "{{ hermes_local_bin }}:/usr/local/bin:/usr/bin:/bin"
+  when: "'ENABLED' not in ha_toolset.stdout"
+  changed_when: true
+
+- name: Report Home Assistant adoption
+  ansible.builtin.debug:
+    msg: >-
+      Home Assistant at {{ hass_url }} adopted (config at {{ ha_config_path }}
+      left untouched). homeassistant toolset {{ 'enabled' if 'ENABLED' in ha_toolset.stdout else 'just enabled' }}.

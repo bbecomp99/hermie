@@ -9,3 +9,7 @@ mm_db_password: ""
 # Mattermost bot token for the hermes gateway (gateway role).
 # Mattermost → System Console → Integrations → Bot Accounts → Add Bot Account.
 mm_bot_token: ""
+
+# Home Assistant long-lived access token (homeassistant role).
+# HA → Profile (bottom-left user) → Security → Long-Lived Access Tokens → Create.
+hass_token: ""

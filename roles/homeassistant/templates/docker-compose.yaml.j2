@@ -1,0 +1,13 @@
+# {{ ansible_managed }}
+# Adopted from the existing ~/homeass/docker-compose.yaml. Service spec is kept
+# identical to the running container so compose treats it as up-to-date.
+services:
+  homeassistant:
+    container_name: homeassistant
+    image: "{{ ha_image }}"
+    volumes:
+      - {{ ha_config_path }}:/config
+      - /etc/localtime:/etc/localtime:ro
+    restart: unless-stopped
+    privileged: true
+    network_mode: host
