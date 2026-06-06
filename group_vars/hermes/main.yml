@@ -9,17 +9,18 @@ hermes_version: "a6e47314f98cccb09f302ad649d8bec30e4b4a2d"  # pinned to the runn
 # ~/.hermes/config.yaml. Switched off MLX (:8080) because mlx_lm.server cannot
 # emit structured tool_calls (tool_turns=0); Ollama returns real tool calls.
 #
-# `default` is a custom Ollama model `llama3.2:3b-hermes` = llama3.2:3b-instruct
-# (native 128K ctx, native tool-calling) with `num_ctx 65536` baked in via a
-# Modelfile, because Hermes Agent refuses any model under 64K context and the
-# OpenAI API can't pass num_ctx. Loads ~4.3GB on Metal (q4_0 KV cache) — fits the
-# 4-4.5GB budget. Recreate on the Mac with:
-#   printf 'FROM llama3.2:3b-instruct-q4_K_M\nPARAMETER num_ctx 65536\n' \
-#     | ollama create llama3.2:3b-hermes -f -
-# (Qwen2.5-7B was tried first: better reasoning but caps at 32K + ~5.3GB, so it
-# can't clear the 64K floor within budget.) MLX still runs on :8080 for the
-# separately-managed ai-serve/stonks coding model.
-hermes_model_default: "llama3.2:3b-hermes"
+# `default` is a custom Ollama model `lfm2.5:8b-hermes` = LiquidAI lfm2.5:8b (an
+# 8.5B MoE, natively 128K ctx, native tool-calling) with `num_ctx 65536` baked in
+# via a Modelfile, because Hermes Agent refuses any model under 64K context and
+# the OpenAI API can't pass num_ctx. Loads ~5.5GB on Metal (q4_0 KV cache) — over
+# the original 4-4.5GB target, but the 16GB M1 Pro has headroom, and the 8B is far
+# better at tool-calling than the 3B (which conflated check_stock's `symbol` arg
+# with Home Assistant's `entity_id`). Recreate on the Mac with:
+#   printf 'FROM lfm2.5:8b\nPARAMETER num_ctx 65536\n' | ollama create lfm2.5:8b-hermes -f -
+# (History: llama3.2:3b-hermes fit the budget at ~4.3GB but was too weak to pick
+# the right tool; Qwen2.5-7B caps at 32K so it couldn't clear the 64K floor.)
+# MLX still runs on :8080 for the separately-managed ai-serve/stonks coding model.
+hermes_model_default: "lfm2.5:8b-hermes"
 hermes_model_provider: "custom"
 hermes_model_base_url: "http://192.168.88.127:11434/v1"
 
