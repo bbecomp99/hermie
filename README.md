@@ -45,6 +45,8 @@ The playbook now does more than install the CLI. Roles run in this order:
 | `gateway`       | Wires the hermes Mattermost channel and runs the messaging gateway user service `hermes-gateway` (bot **@hermie**). |
 | `homeassistant` | Adopts the **existing** Home Assistant container on `.128` (non-disruptive — never touches the HA config/db), and enables the hermes `homeassistant` toolset so the agent can drive HA. |
 | `weather`       | Daily forecast cron delivered to Mattermost (`hermes cron`, script-grounded). |
+| `toolsets`      | Prunes the agent to a minimal per-platform toolset (the bot runs a small 3B that misfires when given too many tools). Idempotent; `--tags toolsets`. |
+| `stockcheck`    | Registers a deterministic `check_stock` MCP tool: fetches the local stonks API, evaluates RVOL / alpha-vol / alpha-price stability, and posts a ✅ LIKE to Mattermost #stonks when a ticker qualifies. `--tags stockcheck`. |
 
 So beyond the CLI, `.128` ends up running long-running services:
 `hermes-dashboard` + `hermes-gateway` (user systemd) and the Mattermost + Home
@@ -76,9 +78,15 @@ ansible-playbook playbook.yml                        # apply
 |------------------------|----------------------------------------------------|-------|
 | `hermes_repo`          | `…/NousResearch/hermes-agent.git`                  | source repo |
 | `hermes_version`       | `main`                                             | branch/tag/commit to deploy |
-| `hermes_model_default` | `mlx-community/DeepSeek-R1-Distill-Qwen-7B-4bit`   | model id served by the MLX box |
+| `hermes_model_default` | `llama3.2:3b-hermes`                               | Ollama model tag (custom 64K-ctx variant; see note) |
 | `hermes_model_provider`| `custom`                                           | provider type in config.yaml |
-| `hermes_model_base_url`| `http://192.168.88.127:8080/v1`                    | the LLM endpoint |
+| `hermes_model_base_url`| `http://192.168.88.127:11434/v1`                   | the LLM endpoint (Ollama; MLX `:8080` retired for the agent) |
+
+> **LLM:** the agent now talks to **Ollama** on the Mac (`:11434`), not MLX —
+> `mlx_lm.server` can't emit structured `tool_calls`. `llama3.2:3b-hermes` is a
+> custom Ollama model (`llama3.2:3b-instruct` + `num_ctx 65536`, since Hermes
+> requires ≥64K context). Recreate it on the Mac with:
+> `printf 'FROM llama3.2:3b-instruct-q4_K_M\nPARAMETER num_ctx 65536\n' | ollama create llama3.2:3b-hermes -f -`
 
 Role toggles in `roles/hermes/defaults/main.yml`: `hermes_python_version`,
 `hermes_install_extras`, `hermes_manage_config`.

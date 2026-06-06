@@ -1,0 +1,207 @@
+#!/usr/bin/env python3
+# {{ ansible_managed }}
+# MCP (stdio) server exposing ONE tool: `check_stock`. Deterministic evaluation
+# of a ticker against three criteria — very high RVOL, high alpha volume, and a
+# flat/stable alpha price — using the local stonks API. If the ticker MEETS ALL
+# of them, it posts a ✅ LIKE verdict to the #stonks Mattermost channel.
+#
+# The math lives HERE (not in the LLM) so the verdict is trustworthy on a small
+# model. Run standalone to test, no MCP/agent needed:
+#     {{ hermes_dir }}/venv/bin/python {{ stockcheck_scripts_dir }}/{{ stockcheck_script_name }} --check NVDA
+# (--check evaluates and prints JSON; it WILL post to #stonks on a LIKE, same as
+#  the live tool. Add --dry-run to evaluate without posting.)
+import json
+import os
+import statistics
+import sys
+import urllib.error
+import urllib.request
+from datetime import date
+
+# ---- config (templated from roles/stockcheck/defaults) ----
+API_BASE = os.environ.get("STOCKCHECK_API_BASE", "{{ stockcheck_api_base }}").rstrip("/")
+RVOL_MIN = float(os.environ.get("STOCKCHECK_RVOL_MIN", "{{ stockcheck_rvol_min }}"))
+ALPHA_VOL_RATIO_MIN = float(os.environ.get("STOCKCHECK_ALPHA_VOL_RATIO_MIN", "{{ stockcheck_alpha_vol_ratio_min }}"))
+ALPHA_PRICE_CV_MAX = float(os.environ.get("STOCKCHECK_ALPHA_PRICE_CV_MAX", "{{ stockcheck_alpha_price_cv_max }}"))
+ALPHA_PRICE_LOOKBACK = int(os.environ.get("STOCKCHECK_ALPHA_PRICE_LOOKBACK", "{{ stockcheck_alpha_price_lookback }}"))
+CHANNEL_ID = os.environ.get("STOCKCHECK_CHANNEL", "{{ stockcheck_channel }}")
+ENV_FILE = os.path.expanduser(os.environ.get("STOCKCHECK_ENV_FILE", "{{ stockcheck_env_file }}"))
+
+
+def _load_env(path):
+    creds = {}
+    try:
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                creds[k.strip()] = v.strip().strip('"').strip("'")
+    except FileNotFoundError:
+        pass
+    return creds
+
+
+def _fetch(symbol):
+    url = f"{API_BASE}/api/llm/symbol/{symbol}"
+    req = urllib.request.Request(url, headers={"Accept": "application/json"})
+    with urllib.request.urlopen(req, timeout=10) as r:
+        return json.load(r)
+
+
+def _post_mattermost(message):
+    env = _load_env(ENV_FILE)
+    base = env.get("MATTERMOST_URL", "").rstrip("/")
+    token = env.get("MATTERMOST_TOKEN", "")
+    if not base or not token:
+        return False, "missing MATTERMOST_URL/TOKEN in .env"
+    data = json.dumps({"channel_id": CHANNEL_ID, "message": message}).encode()
+    req = urllib.request.Request(
+        base + "/api/v4/posts",
+        data=data,
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            return (200 <= r.status < 300), f"status {r.status}"
+    except urllib.error.HTTPError as e:
+        return False, f"http {e.code}: {e.read()[:200]!r}"
+    except Exception as e:  # noqa: BLE001
+        return False, str(e)
+
+
+def _evaluate(payload):
+    """Pure function: payload -> (verdict, metrics dict). No side effects."""
+    cur = payload.get("current") or {}
+    day_vol = cur.get("day_vol")
+    hist_vol = cur.get("hist_vol")
+    alpha_vol = cur.get("alpha_vol")
+    alpha_price_cur = cur.get("alpha_price")
+
+    rvol = (day_vol / hist_vol) if (day_vol and hist_vol) else None
+    avr = (alpha_vol / hist_vol) if (alpha_vol is not None and hist_vol) else None
+
+    # alpha_price stability over the most recent daily entries that actually
+    # carry an alpha_price (many entries hold only options data), plus current.
+    series = [
+        d["alpha_price"]
+        for d in (payload.get("daily") or [])
+        if isinstance(d.get("alpha_price"), (int, float))
+    ][-ALPHA_PRICE_LOOKBACK:]
+    if isinstance(alpha_price_cur, (int, float)):
+        series = series + [alpha_price_cur]
+    cv = None
+    if len(series) >= 2:
+        mean = statistics.fmean(series)
+        if mean:
+            cv = statistics.pstdev(series) / abs(mean)
+
+    checks = {
+        "rvol": {
+            "value": round(rvol, 3) if rvol is not None else None,
+            "min": RVOL_MIN,
+            "pass": rvol is not None and rvol >= RVOL_MIN,
+        },
+        "alpha_vol": {
+            "value": alpha_vol,
+            "ratio": round(avr, 3) if avr is not None else None,
+            "ratio_min": ALPHA_VOL_RATIO_MIN,
+            "pass": alpha_vol is not None and alpha_vol > 0 and avr is not None and avr >= ALPHA_VOL_RATIO_MIN,
+        },
+        "alpha_price_stability": {
+            "cv": round(cv, 4) if cv is not None else None,
+            "cv_max": ALPHA_PRICE_CV_MAX,
+            "n": len(series),
+            "pass": cv is not None and cv <= ALPHA_PRICE_CV_MAX,
+        },
+    }
+    insufficient = rvol is None or avr is None or cv is None
+    if insufficient:
+        verdict = "INSUFFICIENT_DATA"
+    elif all(c["pass"] for c in checks.values()):
+        verdict = "LIKE"
+    else:
+        verdict = "PASS"
+    return verdict, rvol, avr, cv, checks, cur
+
+
+def _format_like(symbol, rvol, avr, cv, cur):
+    cv_pct = f"{cv * 100:.1f}%" if cv is not None else "n/a"
+    av = cur.get("alpha_vol")
+    av_str = f"{av:,}" if isinstance(av, (int, float)) else str(av)
+    return (
+        f"✅ LIKE — {symbol}\n"
+        f"RVOL {rvol:.2f} (≥{RVOL_MIN:g} ✓) · "
+        f"alpha_vol {av_str} ({avr:.2f}× hist ✓) · "
+        f"alpha_price CV {cv_pct} (≤{ALPHA_PRICE_CV_MAX * 100:.0f}% ✓)\n"
+        f"day_avg_price {cur.get('day_avg_price')} · flagged {date.today().isoformat()}"
+    )
+
+
+def check_stock(symbol: str, dry_run: bool = False) -> dict:
+    """Core logic shared by the MCP tool and the --check CLI."""
+    symbol = (symbol or "").strip().upper().lstrip("$")
+    if not symbol or not symbol.isalnum():
+        return {"error": f"invalid symbol {symbol!r}"}
+    try:
+        payload = _fetch(symbol)
+    except Exception as e:  # noqa: BLE001
+        return {"symbol": symbol, "error": f"API fetch failed: {e}"}
+
+    verdict, rvol, avr, cv, checks, cur = _evaluate(payload)
+    result = {
+        "symbol": symbol,
+        "verdict": verdict,
+        "rvol": round(rvol, 3) if rvol is not None else None,
+        "alpha_vol": cur.get("alpha_vol"),
+        "alpha_vol_ratio": round(avr, 3) if avr is not None else None,
+        "alpha_price_cv": round(cv, 4) if cv is not None else None,
+        "day_avg_price": cur.get("day_avg_price"),
+        "checks": checks,
+        "posted_to_stonks": False,
+    }
+    if verdict == "LIKE" and not dry_run:
+        ok, info = _post_mattermost(_format_like(symbol, rvol, avr, cv, cur))
+        result["posted_to_stonks"] = ok
+        result["post_info"] = info
+    return result
+
+
+# ---------------------------------------------------------------------------
+# CLI test mode: `... stockcheck_mcp.py --check SYMBOL [--dry-run]`
+# ---------------------------------------------------------------------------
+if "--check" in sys.argv:
+    i = sys.argv.index("--check")
+    sym = sys.argv[i + 1] if i + 1 < len(sys.argv) else ""
+    print(json.dumps(check_stock(sym, dry_run="--dry-run" in sys.argv), indent=2))
+    sys.exit(0)
+
+# ---------------------------------------------------------------------------
+# MCP stdio server (default mode — this is how hermes launches it)
+# ---------------------------------------------------------------------------
+from mcp.server.fastmcp import FastMCP  # noqa: E402
+
+mcp = FastMCP("{{ stockcheck_server_name }}")
+
+
+@mcp.tool(name="check_stock")
+def check_stock_tool(symbol: str) -> dict:
+    """Check / evaluate / scan a stock ticker against the trading criteria
+    (very high RVOL, high alpha volume, and a flat/stable alpha price) using the
+    local stonks API. If the ticker MEETS ALL the criteria, this posts a ✅ LIKE
+    verdict to the #stonks channel. Use this tool WHENEVER the user asks you to
+    check, look at, scan, evaluate, or get a read on a stock ticker/symbol.
+
+    Args:
+        symbol: the stock ticker, e.g. "NVDA" or "AAPL".
+
+    Returns a dict with the verdict (LIKE / PASS / INSUFFICIENT_DATA), the
+    computed rvol, alpha_vol, alpha_price coefficient-of-variation, and whether
+    a LIKE was posted to #stonks.
+    """
+    return check_stock(symbol)
+
+
+if __name__ == "__main__":
+    mcp.run()

@@ -1,0 +1,52 @@
+---
+# Idempotently prunes the agent's enabled toolsets per platform. Runs as the
+# login user (no become). Idempotency comes from reading the CURRENT
+# platform_toolsets out of config.yaml and only disabling what's still enabled,
+# so a re-run is a no-op (changed=0, no gateway restart).
+
+- name: Get the login uid (for the user systemd runtime dir)
+  ansible.builtin.command: id -u
+  register: uid_cmd
+  changed_when: false
+
+- name: Read current hermes config
+  ansible.builtin.slurp:
+    src: "{{ hermes_home }}/config.yaml"
+  register: toolsets_cfg_raw
+
+- name: Parse the current per-platform toolset enablement
+  ansible.builtin.set_fact:
+    toolsets_current: "{{ (toolsets_cfg_raw.content | b64decode | from_yaml).platform_toolsets | default({}) }}"
+
+# For a platform with NO explicit entry, hermes falls back to ALL toolsets, so
+# every disabled-name still needs disabling. For one WITH an entry, only the
+# names still present in its list need disabling.
+- name: Compute the leftover toolsets to disable per platform
+  ansible.builtin.set_fact:
+    toolsets_todo: >-
+      {{ toolsets_todo | default({}) | combine({
+           item: (toolsets_disabled
+                  if (item not in toolsets_current)
+                  else (toolsets_disabled | intersect(toolsets_current[item] | default([]))))
+         }) }}
+  loop: "{{ toolsets_platforms }}"
+
+- name: Disable unwanted toolsets (per platform, only when still enabled)
+  ansible.builtin.command:
+    argv: "{{ [hermes_dir ~ '/venv/bin/hermes', 'tools', 'disable', '--platform', item.key] + item.value }}"
+  environment:
+    PATH: "{{ hermes_local_bin }}:/usr/local/bin:/usr/bin:/bin"
+  loop: "{{ toolsets_todo | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}: {{ item.value | join(',') if item.value else '(nothing to do)' }}"
+  when: item.value | length > 0
+  changed_when: true
+  notify: Restart hermes gateway for toolsets
+
+- name: Report toolset state
+  ansible.builtin.debug:
+    msg: >-
+      Per-platform prune — {{ toolsets_todo | dict2items
+        | map(attribute='value') | map('length') | sum }} toolset-disables applied
+      across {{ toolsets_platforms | join(', ') }}; kept = everything except
+      {{ toolsets_disabled | join(', ') }}.

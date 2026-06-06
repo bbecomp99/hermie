@@ -1,0 +1,69 @@
+---
+# Deploys the deterministic `check_stock` MCP tool and registers it with hermes
+# so the agent (esp. over Mattermost) calls it when asked to check a ticker.
+# Runs entirely as the login user — no become. Depends on the gateway role
+# having written MATTERMOST_* into ~/.hermes/.env (the tool self-posts a LIKE).
+
+- name: Get the login uid (for the user systemd runtime dir)
+  ansible.builtin.command: id -u
+  register: uid_cmd
+  changed_when: false
+
+- name: Ensure the hermes scripts dir exists
+  ansible.builtin.file:
+    path: "{{ stockcheck_scripts_dir }}"
+    state: directory
+    mode: "0755"
+
+- name: Deploy the stockcheck MCP server
+  ansible.builtin.template:
+    src: stockcheck_mcp.py.j2
+    dest: "{{ stockcheck_scripts_dir }}/{{ stockcheck_script_name }}"
+    mode: "0755"
+  notify: Restart hermes gateway for stockcheck
+
+# Register the MCP server by writing config.yaml directly. We deliberately do
+# NOT use `hermes mcp add` — it's interactive (discovery-first) and blocks
+# forever under Ansible (no TTY). The patcher is idempotent (CHANGED/UNCHANGED).
+- name: Deploy the MCP-registration config patcher
+  ansible.builtin.template:
+    src: set_mcp.py.j2
+    dest: "{{ hermes_home }}/.ansible_set_mcp.py"
+    mode: "0700"
+
+- name: Register the stockcheck MCP server (mcp_servers in config.yaml)
+  ansible.builtin.command:
+    cmd: "{{ hermes_dir }}/venv/bin/python {{ hermes_home }}/.ansible_set_mcp.py"
+  register: stockcheck_set_mcp
+  changed_when: stockcheck_set_mcp.stdout == "CHANGED"
+  notify: Restart hermes gateway for stockcheck
+
+- name: Ensure the check_stock tool is enabled (per-platform — cli + mattermost)
+  ansible.builtin.command:
+    # timeout-guarded: enabling an MCP tool connects to the server to validate;
+    # if it ever blocks, don't hang the whole play.
+    argv:
+      - timeout
+      - "60"
+      - "{{ hermes_dir }}/venv/bin/hermes"
+      - tools
+      - enable
+      - "--platform"
+      - "{{ item }}"
+      - "{{ stockcheck_server_name }}:check_stock"
+  environment:
+    PATH: "{{ hermes_local_bin }}:/usr/local/bin:/usr/bin:/bin"
+  loop: "{{ stockcheck_tool_platforms }}"
+  register: stockcheck_enable
+  changed_when: "'enabled' in (stockcheck_enable.stdout | lower)"
+  failed_when: false
+  notify: Restart hermes gateway for stockcheck
+
+- name: Report stockcheck state
+  ansible.builtin.debug:
+    msg: >-
+      stockcheck MCP registered ({{ stockcheck_set_mcp.stdout | trim }}) ->
+      tool {{ stockcheck_server_name }}:check_stock on {{ stockcheck_tool_platforms | join('+') }};
+      LIKE verdicts post to channel {{ stockcheck_channel }}
+      (RVOL≥{{ stockcheck_rvol_min }}, alpha_vol/hist≥{{ stockcheck_alpha_vol_ratio_min }},
+      alpha_price CV≤{{ stockcheck_alpha_price_cv_max }})

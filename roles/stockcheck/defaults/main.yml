@@ -1,0 +1,38 @@
+---
+# Conversational "check a stock" feature. Registers a deterministic MCP tool
+# `check_stock` that the hermes agent calls when you ask it (in Mattermost) to
+# check/evaluate a ticker. The tool fetches the local stonks API, computes the
+# signals, applies the thresholds below, and — only if the ticker MEETS ALL of
+# them — posts a ✅ LIKE verdict to the #stonks channel. The MATH is done in the
+# script (not by the 3B model) so verdicts are trustworthy; the model just maps
+# "check NVDA" -> check_stock("NVDA") and relays the result.
+
+# --- the data source (reachable from .128 over the LAN) ---
+stockcheck_api_base: "http://192.168.88.127:3000"   # /api/llm/symbol/{SYMBOL}
+
+# --- where a LIKE gets posted ---
+stockcheck_channel: "wx1br6bfat88xffn5johzhizmh"    # Mattermost #stonks (team cloudlogic)
+
+# --- thresholds (TUNABLE — edit and re-run `--tags stockcheck`) ---
+# A ticker is LIKED only if ALL THREE pass.
+stockcheck_rvol_min: 2.0              # "very high RVOL": day_vol / hist_vol >= this
+stockcheck_alpha_vol_ratio_min: 0.10 # "high alpha vol": alpha_vol > 0 AND alpha_vol/hist_vol >= this
+stockcheck_alpha_price_cv_max: 0.05  # "stable/flat alpha price": coeff. of variation <= this (5%)
+stockcheck_alpha_price_lookback: 10  # # of recent daily entries (with alpha_price) used for stability
+
+# --- paths (match the hermes/gateway/weather roles) ---
+hermes_home: "{{ ansible_env.HOME }}/.hermes"
+hermes_dir: "{{ hermes_home }}/hermes-agent"
+hermes_local_bin: "{{ ansible_env.HOME }}/.local/bin"
+stockcheck_scripts_dir: "{{ hermes_home }}/scripts"
+stockcheck_script_name: "stockcheck_mcp.py"
+stockcheck_env_file: "{{ hermes_home }}/.env"        # MATTERMOST_URL/TOKEN read from here
+stockcheck_server_name: "stockcheck"                 # MCP server key -> tool is stockcheck:check_stock
+stockcheck_gateway_service: "hermes-gateway"         # restarted so the bot picks up the new tool
+
+# Tool enablement is PER-PLATFORM in hermes (default platform is cli). The bot
+# runs on mattermost, so the tool must be enabled there explicitly or it stays
+# invisible to the bot. cli is included so `hermes -z` testing works too.
+stockcheck_tool_platforms:
+  - cli
+  - mattermost

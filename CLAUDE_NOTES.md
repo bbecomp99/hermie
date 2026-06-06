@@ -3,6 +3,34 @@
 Running notes for the `hermie` repo so I can catch myself up across sessions.
 Newest context at the top of each section. **No secrets in this file.**
 
+## 2026-06-06 — Ollama migration + toolset prune + stockcheck
+- **LLM switched MLX → Ollama.** `mlx_lm.server` can't emit structured
+  `tool_calls` (returns them as plain text), so all agentic tool use was dead.
+  Installed **Ollama** on the Mac (official `brew install --cask ollama-app` —
+  the bare `ollama` formula ships a broken bottle with no `llama-server` GGUF
+  runner). Runs headless via a launchd agent `~/Library/LaunchAgents/com.hermie.ollama.plist`
+  (never the Electron GUI/updater) on `0.0.0.0:11434`, `OLLAMA_KV_CACHE_TYPE=q4_0`.
+- **Model = `llama3.2:3b-hermes`** (custom: `llama3.2:3b-instruct-q4_K_M` +
+  `num_ctx 65536`). Hermes hard-requires **≥64K context**; Qwen2.5-7B caps at 32K
+  and is 5.3GB, so it couldn't clear the floor within the 4–4.5GB RAM budget.
+  Llama-3.2-3B is natively 128K; at 64K with q4 KV cache it loads ~4.3GB. Repoint
+  is `ansible-playbook playbook.yml --tags model` (config tasks now tagged).
+- **`roles/toolsets`** — the 3B drowned in ~18 toolsets (misfired `messaging` →
+  empty `send_message` spam, confabulated). Prunes per-platform to a minimal set
+  (homeassistant, memory, clarify, +kanban built-in). **Gotcha:** enablement is
+  per-platform in `platform_toolsets:` (NOT `agent.disabled_toolsets`), and
+  `hermes tools disable` defaults to `--platform cli` — the mattermost bot must
+  be pruned explicitly.
+- **`roles/stockcheck`** — deterministic `check_stock` MCP tool: fetches
+  `…127:3000/api/llm/symbol/{SYM}`, computes RVOL (day_vol/hist_vol),
+  alpha_vol/hist ratio, and alpha_price coefficient-of-variation; posts a ✅ LIKE
+  to #stonks when all pass (defaults RVOL≥2.0, ratio≥0.10, CV≤5%). Registered by
+  **writing `mcp_servers` config directly** (the patcher) — `hermes mcp add` is
+  interactive and hangs under Ansible. Engine verified (`--check SPY` → PASS).
+  ⚠️ **The 3B can't reliably INVOKE it** — confuses its `symbol` arg with HA's
+  `entity_id`, or fabricates. Backend solid, model is the weak link. A bigger
+  model (e.g. an 8B) or a deterministic chat trigger would fix invocation.
+
 ## What this repo is
 Ansible project to **deploy & configure the NousResearch Hermes agent** on a
 remote host, pointed at a local MLX LLM. It is *not* application code.

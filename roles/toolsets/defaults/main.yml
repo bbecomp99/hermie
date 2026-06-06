@@ -1,0 +1,40 @@
+---
+# Keeps the agent's toolset minimal. The bot runs on a small 3B model
+# (llama3.2:3b-hermes) which misfires + confabulates when handed too many tools
+# (it was shipped with ~18 toolsets / 33 tools and spammed empty `send_message`
+# calls). This role disables everything except the handful the bot actually
+# needs, PER PLATFORM (hermes stores enablement in `platform_toolsets:` and
+# `hermes tools disable` defaults to --platform cli, so the mattermost bot must
+# be pruned explicitly).
+#
+# What's LEFT enabled after this = whatever ISN'T in the disable list below:
+# homeassistant, memory, clarify (+ kanban, a built-in the disabler won't remove,
+# + the stockcheck MCP tool which is enabled separately by roles/stockcheck).
+
+toolsets_platforms:
+  - cli
+  - mattermost
+
+# Toolsets to disable on every platform above. Edit + re-run `--tags toolsets`.
+toolsets_disabled:
+  - web
+  - browser
+  - terminal
+  - file
+  - code_execution
+  - vision
+  - image_gen
+  - tts
+  - skills
+  - todo
+  - session_search
+  - delegation
+  - cronjob
+  - messaging         # the empty-send_message spam came from this one
+  - computer_use
+
+# Paths / service (match the other roles).
+hermes_home: "{{ ansible_env.HOME }}/.hermes"
+hermes_dir: "{{ hermes_home }}/hermes-agent"
+hermes_local_bin: "{{ ansible_env.HOME }}/.local/bin"
+toolsets_gateway_service: "hermes-gateway"

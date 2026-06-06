@@ -90,6 +90,7 @@
     dest: "{{ hermes_home }}/.ansible_set_model.py"
     mode: "0700"
   when: hermes_manage_config
+  tags: ['model']
 
 - name: "Point hermes at the LLM (model block in config.yaml)"
   ansible.builtin.command:
@@ -98,6 +99,7 @@
   # NB: exact match — 'CHANGED' is a substring of 'UNCHANGED'.
   changed_when: set_model.stdout == "CHANGED"
   when: hermes_manage_config
+  tags: ['model']
 
 - name: Report hermes version
   ansible.builtin.command:

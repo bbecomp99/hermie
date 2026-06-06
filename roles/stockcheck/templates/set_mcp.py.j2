@@ -1,0 +1,43 @@
+#!/usr/bin/env python3
+# {{ ansible_managed }}
+# Idempotently register the stockcheck MCP server in ~/.hermes/config.yaml under
+# `mcp_servers.<name>` ({command, args}), leaving every other setting untouched.
+# We write the config directly instead of `hermes mcp add` because that command
+# is interactive (discovery-first) and blocks forever under Ansible (no TTY).
+# Prints CHANGED / UNCHANGED so Ansible reports accurate change state.
+import os
+import shutil
+
+import yaml
+
+CONFIG = os.path.expanduser("~/.hermes/config.yaml")
+NAME = "{{ stockcheck_server_name }}"
+desired = {
+    "command": "{{ hermes_dir }}/venv/bin/python",
+    "args": ["{{ stockcheck_scripts_dir }}/{{ stockcheck_script_name }}"],
+}
+
+data = {}
+if os.path.exists(CONFIG):
+    with open(CONFIG) as f:
+        data = yaml.safe_load(f) or {}
+
+servers = data.get("mcp_servers") or {}
+cur = servers.get(NAME) or {}
+changed = any(cur.get(k) != v for k, v in desired.items())
+
+if changed:
+    merged = dict(cur)
+    merged.update(desired)
+    servers[NAME] = merged
+    data["mcp_servers"] = servers
+    if os.path.exists(CONFIG):
+        shutil.copy2(CONFIG, CONFIG + ".bak.ansible")
+    tmp = CONFIG + ".tmp"
+    with open(tmp, "w") as f:
+        yaml.safe_dump(data, f, default_flow_style=False, sort_keys=False)
+    os.replace(tmp, CONFIG)
+    os.chmod(CONFIG, 0o600)
+    print("CHANGED")
+else:
+    print("UNCHANGED")

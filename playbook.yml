@@ -10,3 +10,5 @@
     - gateway
     - { role: homeassistant, tags: ['homeassistant', 'ha'] }
     - { role: weather, tags: ['weather'] }
+    - { role: toolsets, tags: ['toolsets'] }
+    - { role: stockcheck, tags: ['stockcheck'] }

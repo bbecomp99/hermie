@@ -4,12 +4,24 @@ hermes_repo: "https://github.com/NousResearch/hermes-agent.git"
 hermes_version: "a6e47314f98cccb09f302ad649d8bec30e4b4a2d"  # pinned to the running commit; bump deliberately
 
 # --- LLM target ---
-# The agent talks to the MLX server running on the Mac (192.168.88.127:8080)
-# over the OpenAI-compatible API. These three keys are written into the
-# `model:` block of ~/.hermes/config.yaml.
-hermes_model_default: "mlx-community/DeepSeek-R1-Distill-Qwen-7B-4bit"
+# The agent talks to Ollama running on the Mac (192.168.88.127:11434) over the
+# OpenAI-compatible API. These three keys are written into the `model:` block of
+# ~/.hermes/config.yaml. Switched off MLX (:8080) because mlx_lm.server cannot
+# emit structured tool_calls (tool_turns=0); Ollama returns real tool calls.
+#
+# `default` is a custom Ollama model `llama3.2:3b-hermes` = llama3.2:3b-instruct
+# (native 128K ctx, native tool-calling) with `num_ctx 65536` baked in via a
+# Modelfile, because Hermes Agent refuses any model under 64K context and the
+# OpenAI API can't pass num_ctx. Loads ~4.3GB on Metal (q4_0 KV cache) — fits the
+# 4-4.5GB budget. Recreate on the Mac with:
+#   printf 'FROM llama3.2:3b-instruct-q4_K_M\nPARAMETER num_ctx 65536\n' \
+#     | ollama create llama3.2:3b-hermes -f -
+# (Qwen2.5-7B was tried first: better reasoning but caps at 32K + ~5.3GB, so it
+# can't clear the 64K floor within budget.) MLX still runs on :8080 for the
+# separately-managed ai-serve/stonks coding model.
+hermes_model_default: "llama3.2:3b-hermes"
 hermes_model_provider: "custom"
-hermes_model_base_url: "http://192.168.88.127:8080/v1"
+hermes_model_base_url: "http://192.168.88.127:11434/v1"
 
 # --- Web dashboard (always-on systemd service) ---
 # LAN-exposed (--insecure) on a trusted home network, same trust model as the
