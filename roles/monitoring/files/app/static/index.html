@@ -165,7 +165,7 @@
             document.getElementById('stat-uptime').innerText = avg === null ? '—' : avg.toFixed(1) + '%';
 
             // targets with a dedicated detail page
-            const detailPages = { mongodb: './mongo.html' };
+            const detailPages = { mongodb: './mongo.html', ollama: './ollama.html' };
 
             document.getElementById('cards').innerHTML = data.targets.map(t => {
                 const up = t.status === 'up';

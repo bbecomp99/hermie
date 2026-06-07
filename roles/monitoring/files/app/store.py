@@ -32,6 +32,12 @@ CREATE TABLE IF NOT EXISTS host_metrics (
     cpu_pct REAL, mem_pct REAL, mem_total_kb INTEGER, mem_avail_kb INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_host_ts ON host_metrics(host, ts);
+
+CREATE TABLE IF NOT EXISTS ollama_perf (
+    ts INTEGER NOT NULL, model TEXT, eval_tps REAL, prompt_tps REAL,
+    load_ms REAL, total_ms REAL, eval_count INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_ollama_ts ON ollama_perf(ts);
 """
 
 
@@ -77,6 +83,16 @@ class Store:
                  m.get("mem_total_kb"), m.get("mem_avail_kb")))
             self._db.commit()
 
+    def insert_ollama_perf(self, m):
+        with self._lock:
+            self._db.execute(
+                "INSERT INTO ollama_perf(ts,model,eval_tps,prompt_tps,load_ms,"
+                "total_ms,eval_count) VALUES(?,?,?,?,?,?,?)",
+                (int(time.time()), m.get("model"), m.get("eval_tps"),
+                 m.get("prompt_tps"), m.get("load_ms"), m.get("total_ms"),
+                 m.get("eval_count")))
+            self._db.commit()
+
     def insert_event(self, target, kind, detail):
         with self._lock:
             self._db.execute(
@@ -87,7 +103,8 @@ class Store:
     def prune(self, days):
         cutoff = int(time.time()) - days * 86400
         with self._lock:
-            for tbl in ("samples", "mongo_perf", "events", "host_metrics"):
+            for tbl in ("samples", "mongo_perf", "events", "host_metrics",
+                        "ollama_perf"):
                 self._db.execute(f"DELETE FROM {tbl} WHERE ts<?", (cutoff,))
             self._db.commit()
 
@@ -108,6 +125,14 @@ class Store:
         return [{"ts": r[0], "write_ms": r[1], "read_ms": r[2], "cmd_ms": r[3],
                  "disk_ms": r[4], "queue": r[5], "dirty_pct": r[6], "conns": r[7]}
                 for r in rows]
+
+    def ollama_history(self, hours=24, limit=1000):
+        since = int(time.time()) - int(hours * 3600)
+        rows = self._range(
+            "SELECT ts,eval_tps,prompt_tps,load_ms FROM ollama_perf WHERE ts>=? "
+            "ORDER BY ts", (since,), limit)
+        return [{"ts": r[0], "eval_tps": r[1], "prompt_tps": r[2],
+                 "load_ms": r[3]} for r in rows]
 
     def history(self, target, hours=24, limit=2000):
         since = int(time.time()) - int(hours * 3600)

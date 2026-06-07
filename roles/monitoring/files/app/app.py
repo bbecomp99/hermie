@@ -22,6 +22,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import hoststat
 import mongo
+import ollama
 import store as store_mod
 
 CONFIG_PATH = os.environ.get("CONFIG_PATH", "/app/config.json")
@@ -61,6 +62,14 @@ def load_config():
     hm.setdefault("ssh_host", "")
     hm.setdefault("ssh_key", "/app/.ssh/id_rsa")
     hm.setdefault("known_hosts", "/app/.ssh/known_hosts")
+    ol = cfg.setdefault("ollama", {})
+    ol.setdefault("enable", False)
+    ol.setdefault("host", "")
+    ol.setdefault("port", 11434)
+    ol.setdefault("model", "")            # blank → auto (use the loaded model)
+    ol.setdefault("canary_interval", 900)  # seconds between throughput canaries
+    ol.setdefault("num_predict", 16)       # tokens generated per canary
+    ol.setdefault("timeout", 120)          # generous: canary may queue behind agent
     return cfg
 
 
@@ -396,16 +405,63 @@ def monitor_loop(cfg, state, store=None, host_latest=None):
 
 
 # ---------------------------------------------------------------------------
+# Ollama throughput canary (own thread — a slow generation must not stall probes)
+# ---------------------------------------------------------------------------
+
+
+def canary_loop(cfg, store=None, ollama_latest=None):
+    """Periodically measure Ollama throughput (tok/s) WITHOUT disturbing the
+    shared production model. Only ever probes a model that is already resident,
+    reusing its exact runner (matched num_ctx + keep_alive=-1) — it never loads,
+    reloads, resizes, or unloads anything. Runs on its own thread so a slow /
+    queued generation can't delay the black-box probe cycle.
+
+    monitor_ollama_model (if set) is a filter: probe ONLY when that model is the
+    one loaded; otherwise we probe whatever is loaded."""
+    ol = cfg["ollama"]
+    interval = max(60, int(ol.get("canary_interval", 900)))
+    timeout = int(ol.get("timeout", 120))
+    want = (ol.get("model") or "").strip()
+    while True:
+        lm = ollama.loaded(ol["host"], int(ol["port"]), timeout=8)
+        if lm is None:
+            print("[argus] ollama canary skipped — no model resident "
+                  "(won't trigger a load)", flush=True)
+        elif want and want != lm["model"]:
+            print(f"[argus] ollama canary skipped — {lm['model']} loaded, "
+                  f"not {want}", flush=True)
+        else:
+            res = ollama.canary(ol["host"], int(ol["port"]), lm["model"],
+                                num_ctx=lm.get("context_length"),
+                                num_predict=int(ol.get("num_predict", 16)),
+                                keep_alive=-1, timeout=timeout)
+            if res:
+                res["context_length"] = lm.get("context_length")
+                res["fetched"] = datetime.now(timezone.utc).isoformat()
+                if ollama_latest is not None:
+                    ollama_latest.clear()
+                    ollama_latest.update(res)
+                print(f"[argus] ollama canary {res['model']} "
+                      f"(ctx {lm.get('context_length')}) "
+                      f"eval={res['eval_tps']} tok/s prompt={res['prompt_tps']} "
+                      f"tok/s load={res['load_ms']}ms", flush=True)
+                if store:
+                    store.insert_ollama_perf(res)
+        time.sleep(interval)
+
+
+# ---------------------------------------------------------------------------
 # HTTP server
 # ---------------------------------------------------------------------------
 
 
-def make_handler(state, cfg, store=None, host_latest=None):
+def make_handler(state, cfg, store=None, host_latest=None, ollama_latest=None):
     # The mongo detail endpoint targets the first tcp probe named like "mongo".
     mongo_target = next(
         (t for t in cfg["targets"]
          if t["type"] == "tcp" and "mongo" in t["name"].lower()), None)
     hm_host = cfg["host_metrics"].get("ssh_host", "")
+    ol_cfg = cfg["ollama"]
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *args):  # silence per-request logging
@@ -445,6 +501,23 @@ def make_handler(state, cfg, store=None, host_latest=None):
                     hours = float(q.get("hours", ["6"])[0])
                     self._send(200, json.dumps(
                         store.host_history(hm_host, hours=hours)).encode())
+            elif path == "/api/ollama":
+                if not ol_cfg.get("enable") or not ol_cfg.get("host"):
+                    self._send(404, b'{"ok":false,"error":"ollama not configured"}')
+                else:
+                    data = ollama.health(ol_cfg["host"], int(ol_cfg["port"]),
+                                         timeout=8)
+                    if ollama_latest:
+                        data["canary"] = dict(ollama_latest)
+                    self._send(200, json.dumps(data).encode())
+            elif path == "/api/ollama/history":
+                if store is None:
+                    self._send(200, b"[]")
+                else:
+                    q = self._query()
+                    hours = float(q.get("hours", ["24"])[0])
+                    self._send(200, json.dumps(
+                        store.ollama_history(hours=hours)).encode())
             elif path == "/api/mongo/history":
                 if store is None:
                     self._send(200, b"[]")
@@ -502,12 +575,22 @@ def main():
     t = threading.Thread(target=monitor_loop,
                          args=(cfg, state, store, host_latest), daemon=True)
     t.start()
+
+    # Ollama throughput canary on its own thread (slow generations must not
+    # block probes); handler reads the newest sample from ollama_latest.
+    ollama_latest = {}
+    if cfg["ollama"]["enable"] and cfg["ollama"]["host"]:
+        threading.Thread(target=canary_loop,
+                         args=(cfg, store, ollama_latest), daemon=True).start()
+
     port = int(cfg["listen_port"])
     print(f"[argus] serving on :{port}, {len(cfg['targets'])} targets, "
           f"interval={cfg['interval']}s, mattermost={cfg['mattermost']['enable']}, "
-          f"host_metrics={cfg['host_metrics']['enable']}", flush=True)
+          f"host_metrics={cfg['host_metrics']['enable']}, "
+          f"ollama={cfg['ollama']['enable']}", flush=True)
     ThreadingHTTPServer(("0.0.0.0", port),
-                        make_handler(state, cfg, store, host_latest)).serve_forever()
+                        make_handler(state, cfg, store, host_latest,
+                                     ollama_latest)).serve_forever()
 
 
 if __name__ == "__main__":

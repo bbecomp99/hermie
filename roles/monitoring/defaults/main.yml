@@ -32,6 +32,21 @@ monitor_host_metrics_host: "{{ monitor_host_142 }}"
 monitor_ssh_key_src: "{{ ansible_env.HOME }}/.ssh/id_rsa"        # key copied into the data dir
 monitor_ssh_known_hosts_src: "{{ ansible_env.HOME }}/.ssh/known_hosts"
 
+# Ollama LLM drill-down — live model state (/api/ps, /api/tags, /api/show) plus a
+# periodic "canary" generation that measures throughput (tok/s), since Ollama has
+# NO passive metrics endpoint. NON-DISRUPTIVE by design: the model is shared with
+# the live agent, so the canary only probes a model that is ALREADY resident and
+# reuses its exact runner (matched num_ctx + keep_alive=-1) — it never loads,
+# reloads, resizes, or unloads anything. If nothing is loaded it skips. Runs on
+# its own thread; persisted to SQLite like the other history.
+monitor_ollama_enable: true
+monitor_ollama_host: "{{ monitor_host_127 }}"   # the Ollama box (.127)
+monitor_ollama_port: 11434
+monitor_ollama_model: ""                         # blank = probe whatever is loaded;
+                                                 # set a name to probe ONLY that model
+monitor_ollama_canary_interval: 900              # seconds between canaries (15 min)
+monitor_ollama_num_predict: 16                   # tokens generated per canary (tiny)
+
 # LAN hosts (kept as vars so the target list below stays readable).
 monitor_host_128: "192.168.88.128"              # the agent box (this host)
 monitor_host_127: "192.168.88.127"              # the Mac dev box
