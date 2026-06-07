@@ -1,0 +1,88 @@
+---
+# Argus — custom lightweight Python service monitor (the all-seeing watch),
+# containerized on
+# .128. Black-box probes (HTTP/TCP) + astonks-styled dashboard + Mattermost
+# alerts on up<->down transitions.
+monitor_dir: "{{ ansible_env.HOME }}/monitor"   # compose project dir on .128
+monitor_image: "argus:latest"
+monitor_container: "argus"
+monitor_uid: 5000                               # pinned container uid (owns the data dir)
+monitor_retention_days: 30                      # prune persisted history older than this
+monitor_port: 9200                              # host + container listen port
+monitor_bind: "0.0.0.0"                         # LAN-reachable (trusted home net)
+monitor_enable: true
+monitor_interval: 30                            # seconds between probe cycles
+monitor_heartbeat_interval: 21600               # "all clear" heartbeat every 6h; 0 disables
+
+# MongoDB perf alerting — the in-engine equivalents of "disk queue rising / CPU
+# saturated": op latency climbing, storage tickets exhausted, ops queued. Posts
+# to Mattermost on transition into/out of "degraded" (no spam). Sampled each
+# probe cycle off the mongodb target.
+monitor_mongo_perf_enable: true
+monitor_mongo_perf_write_latency_ms: 25         # live avg write latency ceiling (ms)
+monitor_mongo_perf_disk_read_ms: 20             # avg ms to fault a page off disk
+monitor_mongo_perf_queue_len: 1                 # storage-engine ops waiting on a ticket
+
+# Host CPU/mem for the Mongo box — collected by one lightweight SSH call per
+# cycle (no agent). Mongo's API can't report host metrics, so Argus SSHes to the
+# box and reads /proc/stat + /proc/meminfo. Uses the login user's existing key.
+monitor_host_metrics_enable: true
+monitor_host_metrics_user: "{{ ansible_user }}"   # ssh user on the Mongo box (.142)
+monitor_host_metrics_host: "{{ monitor_host_142 }}"
+monitor_ssh_key_src: "{{ ansible_env.HOME }}/.ssh/id_rsa"        # key copied into the data dir
+monitor_ssh_known_hosts_src: "{{ ansible_env.HOME }}/.ssh/known_hosts"
+
+# LAN hosts (kept as vars so the target list below stays readable).
+monitor_host_128: "192.168.88.128"              # the agent box (this host)
+monitor_host_127: "192.168.88.127"              # the Mac dev box
+monitor_host_142: "192.168.88.142"              # the LAN MongoDB box
+
+# Mattermost alerting. Reuses the gateway's existing bot token (mm_bot_token,
+# from vault) and posts to the home channel — no new webhook to configure.
+# Disabled automatically if the token/url/channel are blank (see app.py).
+# NOTE: must be the LAN IP, NOT mm_connect_url (127.0.0.1) — the monitor runs in
+# a bridged container where 127.0.0.1 is the container itself, not the host.
+monitor_mm_enable: true
+monitor_mm_url: "http://{{ monitor_host_128 }}:8065"
+monitor_mm_channel_id: "{{ mm_home_channel | default('') }}"
+# monitor_mm_token defaults to mm_bot_token (vault); override per-deploy if needed.
+monitor_mm_token: "{{ mm_bot_token | default('') }}"
+
+# Probe targets. type: http (expect_status/expect_body) or tcp (host/port).
+monitor_targets:
+  - name: dashboard
+    group: ".128 agent box"
+    type: http
+    url: "http://{{ monitor_host_128 }}:9119/"
+    expect_status: [200, 401, 403]
+
+  - name: mattermost
+    group: ".128 agent box"
+    type: http
+    url: "http://{{ monitor_host_128 }}:8065/api/v4/system/ping"
+    expect_status: [200]
+    expect_body: "OK"
+
+  - name: home-assistant
+    group: ".128 agent box"
+    type: http
+    url: "http://{{ monitor_host_128 }}:8123/"
+    expect_status: [200, 401, 403]
+
+  - name: ollama
+    group: ".127 LLM"
+    type: http
+    url: "http://{{ monitor_host_127 }}:11434/api/tags"
+    expect_status: [200]
+
+  - name: astonks-api
+    group: ".127 stonks"
+    type: http
+    url: "http://{{ monitor_host_127 }}:3000/"
+    expect_status: [200]
+
+  - name: mongodb
+    group: ".142 database"
+    type: tcp
+    host: "{{ monitor_host_142 }}"
+    port: 27017

@@ -12,3 +12,4 @@
     - { role: weather, tags: ['weather'] }
     - { role: toolsets, tags: ['toolsets'] }
     - { role: stockcheck, tags: ['stockcheck'] }
+    - { role: monitoring, tags: ['monitoring'] }

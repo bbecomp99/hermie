@@ -1,0 +1,28 @@
+{
+  "interval": {{ monitor_interval }},
+  "listen_port": {{ monitor_port }},
+  "heartbeat_interval": {{ monitor_heartbeat_interval }},
+  "mattermost": {
+    "enable": {{ monitor_mm_enable | bool | to_json }},
+    "url": {{ monitor_mm_url | to_json }},
+    "channel_id": {{ monitor_mm_channel_id | to_json }}
+  },
+  "mongo_perf": {
+    "enable": {{ monitor_mongo_perf_enable | bool | to_json }},
+    "write_latency_ms": {{ monitor_mongo_perf_write_latency_ms }},
+    "disk_read_ms": {{ monitor_mongo_perf_disk_read_ms }},
+    "queue_len": {{ monitor_mongo_perf_queue_len }}
+  },
+  "db": {
+    "path": "/app/data/argus.db",
+    "retention_days": {{ monitor_retention_days }}
+  },
+  "host_metrics": {
+    "enable": {{ monitor_host_metrics_enable | bool | to_json }},
+    "ssh_user": {{ monitor_host_metrics_user | to_json }},
+    "ssh_host": {{ monitor_host_metrics_host | to_json }},
+    "ssh_key": "/app/.ssh/id_rsa",
+    "known_hosts": "/app/.ssh/known_hosts"
+  },
+  "targets": {{ monitor_targets | to_nice_json(indent=4) | indent(2) }}
+}

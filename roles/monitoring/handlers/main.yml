@@ -1,0 +1,23 @@
+---
+# Source changed → rebuild the image and recreate.
+- name: Rebuild monitor stack
+  become: true
+  ansible.builtin.command:
+    cmd: docker compose up -d --build
+    chdir: "{{ monitor_dir }}"
+  register: monitor_rebuild
+  retries: 5
+  delay: 10
+  until: monitor_rebuild.rc == 0
+  changed_when: true
+  when: monitor_enable
+
+# config.json is mounted read-only and read once at startup, so a config-only
+# change needs a container restart (not a rebuild).
+- name: Restart monitor stack
+  become: true
+  ansible.builtin.command:
+    cmd: docker compose restart
+    chdir: "{{ monitor_dir }}"
+  changed_when: true
+  when: monitor_enable

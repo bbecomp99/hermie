@@ -1,0 +1,114 @@
+---
+- name: Ensure docker is available
+  ansible.builtin.command: docker --version
+  changed_when: false
+
+- name: Create the compose project dir (owned by the login user)
+  become: true
+  ansible.builtin.file:
+    path: "{{ monitor_dir }}"
+    state: directory
+    owner: "{{ ansible_user }}"
+    group: "{{ ansible_user }}"
+    mode: "0755"
+
+# The SQLite data dir must be writable by the container's pinned uid (it creates
+# argus.db + the -wal/-shm sidecars). Owned by monitor_uid, not the login user.
+- name: Create the persisted data dir (owned by the container uid)
+  become: true
+  ansible.builtin.file:
+    path: "{{ monitor_dir }}/data"
+    state: directory
+    owner: "{{ monitor_uid }}"
+    group: "{{ monitor_uid }}"
+    mode: "0755"
+
+# Host CPU/mem is collected by SSHing to the Mongo box. The container runs as
+# uid {{ monitor_uid }}, so it can't read the login user's 0600 key directly —
+# stage a copy owned by that uid in a dir mounted read-only into the container.
+- name: Create the SSH key dir for host-metrics (container uid)
+  become: true
+  ansible.builtin.file:
+    path: "{{ monitor_dir }}/ssh"
+    state: directory
+    owner: "{{ monitor_uid }}"
+    group: "{{ monitor_uid }}"
+    mode: "0700"
+  when: monitor_host_metrics_enable
+
+- name: Stage the SSH private key + known_hosts for the container
+  become: true
+  ansible.builtin.copy:
+    src: "{{ item.src }}"
+    dest: "{{ monitor_dir }}/ssh/{{ item.name }}"
+    remote_src: true
+    owner: "{{ monitor_uid }}"
+    group: "{{ monitor_uid }}"
+    mode: "{{ item.mode }}"
+  loop:
+    - { src: "{{ monitor_ssh_key_src }}", name: "id_rsa", mode: "0600" }
+    - { src: "{{ monitor_ssh_known_hosts_src }}", name: "known_hosts", mode: "0644" }
+  when: monitor_host_metrics_enable
+  notify: Restart monitor stack
+
+- name: Sync the monitor app source (build context)
+  become: true
+  ansible.builtin.copy:
+    src: app/
+    dest: "{{ monitor_dir }}/app/"
+    owner: "{{ ansible_user }}"
+    group: "{{ ansible_user }}"
+    mode: "0644"
+    directory_mode: "0755"
+  notify: Rebuild monitor stack
+
+- name: Deploy the monitor config.json
+  become: true
+  ansible.builtin.template:
+    src: config.json.j2
+    dest: "{{ monitor_dir }}/config.json"
+    owner: "{{ ansible_user }}"
+    group: "{{ ansible_user }}"
+    mode: "0644"            # non-secret: token is injected via env, not here
+  notify: Restart monitor stack
+
+- name: Deploy the docker-compose.yml
+  become: true
+  ansible.builtin.template:
+    src: docker-compose.yml.j2
+    dest: "{{ monitor_dir }}/docker-compose.yml"
+    owner: "{{ ansible_user }}"
+    group: "{{ ansible_user }}"
+    mode: "0600"            # contains the Mattermost bot token (MM_TOKEN)
+  notify: Rebuild monitor stack
+
+- name: Bring up the monitor stack
+  become: true
+  ansible.builtin.command:
+    cmd: docker compose up -d --build
+    chdir: "{{ monitor_dir }}"
+  register: monitor_up
+  # .128 has flaky IPv6 routing; the first-run base-image pull can fail
+  # intermittently before Docker falls back to IPv4. Retry a few times.
+  retries: 5
+  delay: 10
+  until: monitor_up.rc == 0
+  changed_when: >-
+    ('Started' in monitor_up.stderr) or ('Created' in monitor_up.stderr)
+    or ('Recreated' in monitor_up.stderr) or ('Built' in monitor_up.stderr)
+    or ('Pulling' in monitor_up.stderr)
+  when: monitor_enable
+
+- name: Wait for the monitor to answer on its port
+  ansible.builtin.wait_for:
+    host: 127.0.0.1
+    port: "{{ monitor_port }}"
+    timeout: 120
+  when: monitor_enable
+
+- name: Show the monitor URL
+  ansible.builtin.debug:
+    msg: >-
+      Argus (all-seeing watch) at http://{{ ansible_default_ipv4.address | default(monitor_host_128) }}:{{ monitor_port }}/
+      — {{ monitor_targets | length }} targets, {{ monitor_interval }}s interval,
+      Mattermost alerts {{ 'ON' if (monitor_mm_enable and monitor_mm_token | length > 0) else 'OFF' }}.

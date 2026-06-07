@@ -47,6 +47,7 @@ The playbook now does more than install the CLI. Roles run in this order:
 | `weather`       | Daily forecast cron delivered to Mattermost (`hermes cron`, script-grounded). |
 | `toolsets`      | Prunes the agent to a minimal per-platform toolset (the bot runs a small 3B that misfires when given too many tools). Idempotent; `--tags toolsets`. |
 | `stockcheck`    | Registers a deterministic `check_stock` MCP tool: fetches the local stonks API, evaluates RVOL / alpha-vol / alpha-price stability, and posts a ✅ LIKE to Mattermost #stonks when a ticker qualifies. `--tags stockcheck`. |
+| `monitoring`    | **Argus** — *the all-seeing watch.* A custom, dependency-free Python service monitor in Docker (container `argus`), bound `0.0.0.0:9200`. Black-box HTTP/TCP probes the dashboard, Mattermost, Home Assistant, Ollama (`.127`), astonks-api (`.127`) and MongoDB (`.142`); astonks-styled dashboard + `/api/status`; posts to Mattermost on every up↔down transition **and** a 6-hourly all-clear heartbeat (reuses the gateway bot token). `--tags monitoring`. |
 
 So beyond the CLI, `.128` ends up running long-running services:
 `hermes-dashboard` + `hermes-gateway` (user systemd) and the Mattermost + Home
