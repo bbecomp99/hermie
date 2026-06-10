@@ -1,0 +1,21 @@
+# {{ ansible_managed }}
+services:
+  monitor:
+    build: ./app
+    image: {{ monitor_image }}
+    container_name: {{ monitor_container }}
+    restart: unless-stopped
+    ports:
+      - "{{ monitor_bind }}:{{ monitor_port }}:{{ monitor_port }}"
+    environment:
+      CONFIG_PATH: /app/config.json
+      # Bot token injected at runtime — kept out of config.json and the image.
+      MM_TOKEN: "{{ monitor_mm_token }}"
+    volumes:
+      - {{ monitor_dir }}/config.json:/app/config.json:ro
+      # Persisted SQLite history — survives container rebuild/redeploy.
+      - {{ monitor_dir }}/data:/app/data
+{% if monitor_host_metrics_enable %}
+      # SSH key for collecting host CPU/mem from the Mongo box (read-only).
+      - {{ monitor_dir }}/ssh:/app/.ssh:ro
+{% endif %}

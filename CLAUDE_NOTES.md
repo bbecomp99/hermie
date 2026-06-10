@@ -3,7 +3,224 @@
 Running notes for the `hermie` repo so I can catch myself up across sessions.
 Newest context at the top of each section. **No secrets in this file.**
 
+## 2026-06-07 — Argus: split host charts + cleared latency history
+- Per user, **split the combined host CPU+Mem dual-line chart into two separate
+  single-line charts** (`#cpuChart` gold, `#memChart` sky), side-by-side under the
+  CPU/Memory hero cards, sharing one 1H/1D/1W/1M range toolbar. `drawHostTrend()`
+  now calls `_drawHostChart(elId,axisId,series,color)` twice (fixed 0–100% scale,
+  per-chart "now X% · peak Y%" axis).
+- **Cleared `mongo_perf` table** (109→0 rows) to drop two getmore-spike artifacts
+  from the latency trend — fresh data only. host_metrics + samples left intact.
+  Done via `docker exec argus python -c "...DELETE FROM mongo_perf..."` (WAL, live).
+- This is the last edit before the first commit of the whole Argus build.
+
+## 2026-06-07 — Argus: host CPU/mem for the Mongo box (.142) via SSH
+- User wanted DB-server CPU + memory graphs. Mongo's API can't report host CPU →
+  collect over **SSH, NO agent** (user's call). `files/app/hoststat.py` (stdlib):
+  one `ssh user@.142 'grep "^cpu " /proc/stat; sleep 1; grep ...; cat
+  /proc/meminfo'` per 30s cycle → CPU% from the two /proc/stat snapshots, mem% from
+  MemTotal/MemAvailable. Parser verified against real output (cpu ~5%, mem 96.2% —
+  the box runs tight, ~1.25GB free of 31GB; WiredTiger eats RAM).
+- **SSH access (OUT OF BAND — not in Ansible, prerequisite):** my Mac key was
+  denied on .142; .128's pinky key wasn't authorized either. Installed `sshpass`
+  on .128 (apt) and ran `ssh-copy-id` of **.128's `~/.ssh/id_rsa.pub`** to
+  `pinky@192.168.88.142` using the repo `.env` password. Now .128→.142 is
+  key-based. `.142` is NOT in the inventory; only this key trust enables it.
+  Reading /proc needs NO sudo (world-readable).
+- **Container does the SSH:** added `openssh-client` to the image; ansible stages
+  a COPY of pinky's id_rsa + known_hosts into `{{monitor_dir}}/ssh` owned by uid
+  5000 (container can't read pinky's 0600 key otherwise), mounted `:/app/.ssh:ro`.
+  ssh uses `-i /app/.ssh/id_rsa -o UserKnownHostsFile=... -o StrictHostKeyChecking=yes`.
+  ⚠️ This puts a copy of pinky's full key in the container — fine on trusted LAN;
+  could harden with a forced-command restricted key later.
+- **Wiring:** new `host_metrics` SQLite table (+ prune); loop samples → persists +
+  caches latest in a shared `host_latest` dict; `/api/mongo` gets `hostMetrics`,
+  new `/api/host/history?hours=`. Mongo page got a **"Host · .142"** section: CPU
+  + Memory hero cards (thresholded) + a fixed-0–100% dual-line chart (gold CPU /
+  sky mem) with the same 1H/1D/1W/1M buttons. Defaults: `monitor_host_metrics_*`.
+- VERIFIED on .128: container SSHes .142, log shows cpu/mem, /api/mongo.hostMetrics
+  populated, history + DB table accumulating, page renders the section.
+
+## 2026-06-07 — Argus: Greek "Obsidian & Bronze" restyle + read-latency fix
+- **Read-latency artifact fixed:** hero card was showing Mongo's *lifetime* avg
+  (~3624ms) via a fallback when no reads happened in the interval — inflated by
+  getmore (idle tailable-cursor waits counted as read latency). Removed the
+  lifetime fallback; hero now shows live delta only, "idle · no reads" when none.
+  Trend/persistence already used live deltas (correct). True read-query latency
+  (getmore-excluded) would need the profiler — offered, user declined.
+- **Restyle (both pages):** theme = obsidian ground + antique-bronze/gold + Aegean
+  teal + parchment text. Google Fonts **Cinzel** (lapidary caps) for h1/h2 +
+  **Cormorant Garamond** italic taglines. `.glass` redefined frosted→marble-tablet
+  (stone gradient + bronze hairline + inset). Added `.cornice` (CSS dentil strip
+  under each nav), `.medallion` (bronze ring around the 👁 / 🍃), `.bronze`/`.jade`
+  gradient title classes. Title rendered **ARGVS** (Roman V-for-U). Reskinned the
+  neutral slate ramp (text/bg/border-slate-*) → warm stone/parchment via targeted
+  `!important` overrides on the Tailwind utility classes, leaving status colours
+  (emerald/red/amber/blue) intact for legibility. Tailwind CDN unchanged.
+- Deployed + healthy; fonts + theme classes confirmed in served HTML.
+
+## 2026-06-07 — Argus: dual-line latency chart + range selector
+- Mongo detail trend went from a single live-appended write-latency sparkline to a
+  **history-driven dual-line chart** (write = emerald, read = sky) fed by
+  `/api/mongo/history`, with **1H / 1D / 1W / 1M** range buttons (`setRange(h)` →
+  `loadTrend()` re-fetches that window). `drawTrend()` paints two polylines scaled
+  to a shared max, with a 0–max label, point count, and start/end time axis;
+  called after each render() so it survives the 5s page rebuild. Trend refreshes
+  on its own 30s interval (matches sample cadence); removed the old `latHist`
+  buffer + `latSpark()`. Live hero cards (write/read/disk/queue) unchanged.
+- NOTE: `read_ms` is sparse (most 30s windows have 0 read ops on this DB → null);
+  the read line plots only non-null points (connects across gaps) — accurate, not
+  a bug. Fills in over longer ranges.
+- Verified: JS `node --check` clean; page serves buttons + chart; all 4 range
+  endpoints respond; DB survived the rebuild (rows kept growing, not reset).
+
+## 2026-06-07 — Argus: SQLite persistence (history survives restart)
+- User wanted history not lost on refresh/redeploy, on a ~3GB-RAM box, NVMe disk.
+  Chose **embedded SQLite** (`store.py`, stdlib `sqlite3`) — NOT a DB service:
+  zero standalone RAM (a file), no daemon, keeps Argus dependency-free. WAL mode,
+  single lock-guarded connection (write volume ~7 rows/30s), 30-day retention
+  prune (hourly).
+- **Schema:** `samples`(ts,target,status,latency), `mongo_perf`(ts,write/read/cmd/
+  disk_ms,queue,tickets,dirty_pct,conns), `events`(transitions + mongo degraded/
+  recovered). Loop persists every cycle; `eval_mongo_perf` now returns the full
+  metrics dict (refactored via `_avg_ms`) so perf rows are stored.
+- **New endpoints:** `/api/mongo/history?hours=` + `/api/history?target=&hours=`
+  (downsampled to cap payload). `mongo.html` **seeds the write-latency sparkline
+  from `/api/mongo/history` on load** → a page refresh no longer wipes the trend.
+  On startup `State.seed()` reloads the per-target ring from `recent_status()` so
+  **uptime% survives a redeploy** (verified: post-restart uptime=100%, spark=60
+  before any new probe).
+- **Container/infra:** pinned container uid **5000** (`useradd --uid 5000`), host
+  data dir `{{ monitor_dir }}/data` chowned to 5000 (new ansible task), bind-
+  mounted `:/app/data` (read-write, survives rebuild). DB path
+  `/app/data/argus.db`. Defaults: `monitor_uid=5000`, `monitor_retention_days=30`.
+- If SQLite init fails, app logs `persistence DISABLED` and runs in-memory (graceful).
+- VERIFIED on .128: argus.db + -wal/-shm owned 5000 in /home/pinky/monitor/data,
+  rows accumulating, history endpoints serve, restart-seed works.
+
+## 2026-06-07 — Argus: Mongo latency & saturation monitoring
+- User (ex-SQL-DBA) wanted the classic "disk-queue rising / CPU saturated crushes
+  the DB" early-warning, translated to Mongo/WiredTiger. Added on both the page
+  AND as proactive alerts.
+- **Mongo 8.x field locations (verified on .142):** opLatencies under
+  `serverStatus.opLatencies.{reads,writes,commands}.{latency(µs cumulative),ops}`;
+  storage tickets MOVED from `wiredTiger.concurrentTransactions` (null in 8.x) to
+  **`serverStatus.queues.execution.{read,write}`** = {out, available, totalTickets,
+  normalPriority.queueLength, normalPriority.totalTimeQueuedMicros,
+  maxAcquisitionDelinquencyMillis}. The "disk latency hitting queries" signal =
+  `wiredTiger.cache['application threads page read from disk to cache time/count']`
+  → Δtime/Δcount = avg ms to fault a page off disk. hostInfo gives numCores (NOT
+  live CPU — Mongo doesn't expose host CPU; .142 host CPU would need a node
+  exporter, not done).
+- **Detail page** (`mongo.html`) got a prominent "Latency & Saturation" section:
+  hero cards (write/read/disk latency, storage-queue tickets) colour-thresholded,
+  a **write-latency trend SVG sparkline** (client-side 80-sample history), plus
+  cmd latency / dirty-cache% / queue-wait-ms/s / flow-throttle rows, and a
+  read+write "Storage tickets (queue depth)" card. Rates computed client-side from
+  deltas between 5s polls.
+- **Proactive alerting** in `app.py` loop: each cycle calls new lightweight
+  `mongo.perf_sample()` (single serverStatus), computes live write latency + disk
+  read ms + queue length + ticket exhaustion + flowControl lag, and posts
+  `👁 Argus · ⚠️ MongoDB degraded — <reasons>` / recovered to Mattermost on
+  transition only. Thresholds in defaults: `monitor_mongo_perf_*`
+  (write_latency_ms=25, disk_read_ms=20, queue_len=1). VERIFIED on .128: sampler
+  runs every 30s, live ~1ms write / 0.2ms disk / queue 0 = "ok", no false alarms.
+
+## 2026-06-07 — Argus: MongoDB deep-dive detail page
+- **Clickable `mongodb` tile** on the dashboard → dedicated `mongo.html` detail
+  page (same glass style; back-link to Argus). Generalized via a `detailPages`
+  map in index.html so other services can get detail pages later.
+- **Pure-stdlib MongoDB client** (`files/app/mongo.py`) — hand-rolled BSON
+  encode/decode + `OP_MSG` (opcode 2013) over a raw socket. NO pymongo, keeps the
+  zero-dep ethos. Read-only diagnostics only; **no SCRAM auth** (the target mongod
+  at `192.168.88.142:27017` accepts anonymous admin commands — confirmed via the
+  astonks conn string `mongodb://192.168.88.142:27017/stonksDB`, no creds).
+- **`/api/mongo` endpoint** runs `isMaster` + `serverStatus` + `listDatabases` +
+  per-db `dbStats` (+ `replSetGetStatus`, gracefully null on standalone) and
+  curates: version/uptime/engine, connections, opcounters, network, mem,
+  WiredTiger cache (+ tickets), globalLock concurrency, asserts, document metrics,
+  query executor, and a databases table. Page computes per-second RATES
+  client-side from deltas between 5s polls.
+- **VALIDATED against real Mongo 8.2.2** (from .127 AND from the deployed
+  container on .128 → .142 over LAN): 5 dbs, stonksDB = 11 colls / 24.2M objs /
+  27GB / 25 idx, 73 conns, 12.9GB/16GB cache. Wire protocol confirmed working.
+  Deployed + healthy.
+
+## 2026-06-07 — Monitor renamed → **Argus** (the all-seeing watch)
+- Rebranded "Hermie Monitor" → **Argus** (Argus Panoptes, the hundred-eyed myth
+  watchman — fits the Greek/Hermes theme; Hermes famously slew Argus, now runs
+  his own). Changed: UI heading+title+👁, MM alert/heartbeat messages now
+  prefixed `👁 **Argus** · …`, container_name + image → `argus`/`argus:latest`,
+  log prefix `[argus]`, README/docs. Role dir + var prefix stay `monitoring`/
+  `monitor_*` (internal; not user-facing). Compose project still `~/monitor`
+  (service key `monitor`) so the rename recreated in place via compose labels —
+  old `hermie-monitor` container + image removed, no port-9200 conflict.
+- Redeployed + verified: `argus` Up (healthy), UI shows ARGUS, 6/6 green, old
+  image pruned.
+
+## 2026-06-07 — Monitoring: deployed + MM-url fix + heartbeat
+- **DEPLOYED to `.128`** (via `--ask-become-pass`; `pinky` is in `sudo` but NOT
+  `docker`, so the role's `become: true` needs the sudo pw — it's in the repo
+  `.env` as `PASS`). All 6 targets green on first converge. Container
+  `hermie-monitor`, dashboard at http://192.168.88.128:9200/.
+- **BUGFIX (caught post-deploy):** `monitor_mm_url` had inherited the gateway's
+  `mm_connect_url` = `http://127.0.0.1:8065`, which is unreachable from the
+  bridged monitor container (127.0.0.1 = the container itself) → alerts would
+  silently fail. Changed default to the LAN IP `http://192.168.88.128:8065`
+  (Mattermost binds `0.0.0.0:8065`). Verified the container can now reach the MM
+  ping. **Lesson: never point a containerized client at 127.0.0.1 for a host svc.**
+- **Heartbeat added:** in-app timer (`monitor_heartbeat_interval`, default 21600s
+  = 6h; 0 disables) posts an "all-clear" summary to Town Square every 6h
+  regardless of transitions — `:white_check_mark: All clear — N/M up`, or
+  `:yellow_heart: Heartbeat — … DOWN: <names>` if anything's down. Clock counts
+  from container start so redeploys don't spam. Transition alerts unchanged.
+- **Alert channel = Town Square** (`mm_home_channel`, id bkkf739…), same as cron.
+- **Still UNCOMMITTED on `main`** — whole `monitoring` role + playbook/README/notes.
+
+## 2026-06-07 — Custom monitoring stack (Hermie Monitor)
+- **New `monitoring` role** — a 100% custom, **dependency-free Python** service
+  monitor (no pip deps, `python:3.12-slim`, ~50MB), containerized on `.128` via
+  the same compose pattern as the mattermost role. Built fresh instead of using
+  Uptime Kuma/Prometheus (user wanted a bespoke lightweight app styled like
+  astonks).
+- **What it does:** background thread black-box probes targets every 30s — two
+  probe types, `http` (urllib; checks status set + optional body substring) and
+  `tcp` (socket connect). Serves `/api/status` (JSON) + `/` (astonks-styled glass
+  dashboard: Tailwind CDN, dark slate, status dots, latency, uptime %, sparkline,
+  10s auto-refresh) + `/healthz`. In-memory state only (60-sample ring buffer per
+  target); resets on restart — fine for v1.
+- **Targets (6):** dashboard `:9119`, mattermost `:8065/api/v4/system/ping`,
+  home-assistant `:8123` (all `.128`); ollama `.127:11434/api/tags`; astonks-api
+  `.127:3000`; mongodb `.142:27017` (tcp). Postgres is unpublished → covered
+  transitively by the MM ping. **Gateway** (user-systemd, no port) can't be
+  black-box probed from a container → left a documented `/api/push/<name>` hook
+  idea (NOT built) for a host cron to heartbeat it later.
+- **Alerting:** posts to Mattermost **only on up↔down transitions** (no spam) via
+  the `/api/v4/posts` API, **reusing the existing gateway bot token** (`mm_bot_token`
+  from vault) + `mm_home_channel` — no new webhook/secret. Auto-disables if
+  token/url/channel are blank. Token injected via `MM_TOKEN` env (compose file is
+  `0600`); it is NOT written into `config.json` (which is world-readable `0644`).
+- **Layout:** `roles/monitoring/{defaults,tasks,handlers,templates}` +
+  `files/app/{Dockerfile,app.py,static/index.html}`. Port **9200**. Wired into
+  `playbook.yml` with `tags: ['monitoring']`. Two handlers: *Rebuild* (source
+  change → `up -d --build`) vs *Restart* (config-only → `compose restart`, since
+  config.json is read once at startup behind a read-only mount).
+- **Validated locally:** app smoke-tested (http+tcp probes, down-detection,
+  down-first sort, uptime/sparkline, dashboard all serve); `config.json.j2`
+  renders to valid JSON with host vars resolved; `ansible-playbook --syntax-check`
+  passes. **NOT yet deployed to `.128`** — remote converge is gated on user.
+  Deploy with: `ansible-playbook playbook.yml --tags monitoring`.
+
 ## 2026-06-06 — Ollama migration + toolset prune + stockcheck
+- **Model pinned hot in memory.** Flipped `OLLAMA_KEEP_ALIVE` `1h` → `-1` in
+  `~/Library/LaunchAgents/com.hermie.ollama.plist` (then
+  `launchctl bootout/bootstrap gui/$UID` + a preload `curl …/api/generate -d
+  '{"model":"lfm2.5:8b-hermes","keep_alive":-1}'`). `ollama ps` now shows
+  `UNTIL = Forever`, 100% GPU, 65536 ctx. No more cold-start wait on the first
+  request after idle; costs ~5.5GB RSS held permanently (fine on the 16GB box).
+  Only a reboot or `ollama serve` restart drops it (first call after re-pays the
+  load). ⚠️ The plist lives on this Mac (.127), NOT tracked in the repo — this
+  log is the only record.
 - **LLM switched MLX → Ollama.** `mlx_lm.server` can't emit structured
   `tool_calls` (returns them as plain text), so all agentic tool use was dead.
   Installed **Ollama** on the Mac (official `brew install --cask ollama-app` —

@@ -1,0 +1,222 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Argus · all-seeing watch</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Cinzel:wght@500;600;700&family=Cormorant+Garamond:ital,wght@0,500;0,600;1,500&display=swap" rel="stylesheet">
+    <style>
+        /* ── Argus theme: Obsidian & Bronze (a temple at night) ── */
+        :root {
+            --obsidian:#0b0d11; --stone:#15171d; --stone2:#1b1e26;
+            --bronze:#c9a227; --bronze-hi:#e7c869; --aegean:#2a9d8f;
+            --parchment:#ece6d6; --tan:#9d9482;
+        }
+        body {
+            background:
+                radial-gradient(1100px 560px at 50% -12%, rgba(201,162,39,.07), transparent 60%),
+                radial-gradient(900px 520px at 100% 0%, rgba(42,157,143,.05), transparent 55%),
+                var(--obsidian);
+            color: var(--parchment);
+            font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+        }
+        h1, h2, .cinzel { font-family: 'Cinzel', Georgia, 'Times New Roman', serif; letter-spacing: .045em; }
+        .tagline { font-family: 'Cormorant Garamond', Georgia, serif; font-style: italic; letter-spacing: .02em; }
+
+        /* marble tablet cards (replaces the old frosted glass) */
+        .glass {
+            background:
+                linear-gradient(180deg, rgba(255,255,255,.025), rgba(0,0,0,.12)),
+                linear-gradient(145deg, var(--stone2), var(--stone));
+            border: 1px solid rgba(201,162,39,.18);
+            box-shadow: inset 0 1px 0 rgba(255,255,255,.045), 0 10px 28px rgba(0,0,0,.38);
+        }
+        .bronze { background: linear-gradient(92deg, var(--bronze-hi), var(--bronze) 55%, #9c7b1e);
+                  -webkit-background-clip: text; background-clip: text; color: transparent; }
+
+        /* classical dentil cornice strip */
+        .cornice {
+            height: 12px; opacity: .85;
+            background:
+                linear-gradient(var(--bronze),var(--bronze)) left top/100% 1.5px no-repeat,
+                linear-gradient(var(--bronze),var(--bronze)) left bottom/100% 1.5px no-repeat,
+                repeating-linear-gradient(90deg, var(--bronze) 0 5px, transparent 5px 11px) center/100% 5px no-repeat;
+        }
+        /* bronze medallion for the eye */
+        .medallion { border: 1.5px solid rgba(201,162,39,.55); border-radius: 9999px;
+                     box-shadow: inset 0 0 12px rgba(201,162,39,.18), 0 0 0 4px rgba(201,162,39,.06); }
+
+        ::-webkit-scrollbar { width: 9px; height: 9px; }
+        ::-webkit-scrollbar-track { background: rgba(0,0,0,.25); }
+        ::-webkit-scrollbar-thumb { background: linear-gradient(var(--bronze),#8a6d1a); border-radius: 6px; }
+
+        @keyframes shimmer { 0% { background-position: -800px 0; } 100% { background-position: 800px 0; } }
+        .skel { background: linear-gradient(90deg, #1b1e26 25%, #2a2c1f 50%, #1b1e26 75%); background-size: 800px 100%; animation: shimmer 1.4s ease-in-out infinite; display: inline-block; }
+        @keyframes pulsedot { 0%,100% { opacity: 1; } 50% { opacity: 0.35; } }
+        .live { animation: pulsedot 1.6s ease-in-out infinite; }
+
+        /* warm the neutral slate ramp → stone/parchment (keeps status colours intact) */
+        .text-white{color:var(--parchment)!important}
+        .text-slate-200{color:#dad2c0!important}
+        .text-slate-300{color:#c4bca9!important}
+        .text-slate-400{color:#9d9482!important}
+        .text-slate-500{color:#857c6b!important}
+        .text-slate-600{color:#6b6353!important}
+        .bg-slate-900{background-color:#0f1116!important}
+        .bg-slate-800{background-color:#191c23!important}
+        .bg-slate-700{background-color:#23262f!important}
+        .hover\:bg-slate-600:hover{background-color:#2d313c!important}
+        .hover\:bg-slate-800:hover{background-color:#191c23!important}
+        .border-slate-600{border-color:rgba(201,162,39,.24)!important}
+        .border-slate-700{border-color:rgba(201,162,39,.16)!important}
+        .border-slate-800{border-color:rgba(201,162,39,.10)!important}
+    </style>
+</head>
+<body class="p-6 min-h-screen flex flex-col">
+    <nav class="glass sticky top-0 z-50 px-6 pt-4 pb-0 mb-6 rounded-xl shadow-lg overflow-hidden">
+        <div class="flex justify-between items-center">
+            <div class="flex items-center gap-4">
+                <span class="medallion w-12 h-12 flex items-center justify-center text-2xl leading-none select-none" title="Argus Panoptes — the all-seeing watchman">👁</span>
+                <div>
+                    <h1 class="text-3xl font-bold bronze">ARGUS</h1>
+                    <p class="tagline text-sm text-slate-400 mt-0.5">the all-seeing watch · keeper of the services</p>
+                </div>
+            </div>
+            <div class="flex items-center space-x-4">
+                <p class="text-sm text-slate-400" id="refreshTime">Initializing…</p>
+                <button onclick="load()" class="bg-slate-700 hover:bg-slate-600 text-white text-sm font-semibold py-2 px-3 rounded-lg transition shadow-md flex items-center" style="border:1px solid rgba(201,162,39,.25)">
+                    Refresh <span class="ml-2">↻</span>
+                </button>
+            </div>
+        </div>
+        <div class="cornice mt-4"></div>
+    </nav>
+
+    <main class="w-full flex-grow">
+        <!-- Summary -->
+        <div class="grid grid-cols-2 md:grid-cols-4 gap-6 mb-8">
+            <div class="glass p-6 rounded-xl border-b-4 border-slate-500 shadow-md">
+                <p class="text-xs uppercase text-slate-400 mb-1 font-semibold tracking-wider">Targets</p>
+                <p class="text-2xl font-bold text-white" id="stat-total"></p>
+            </div>
+            <div class="glass p-6 rounded-xl border-b-4 border-emerald-500 shadow-md">
+                <p class="text-xs uppercase text-slate-400 mb-1 font-semibold tracking-wider">Up</p>
+                <p class="text-2xl font-bold text-emerald-400" id="stat-up"></p>
+            </div>
+            <div class="glass p-6 rounded-xl border-b-4 border-red-500 shadow-md">
+                <p class="text-xs uppercase text-slate-400 mb-1 font-semibold tracking-wider">Down</p>
+                <p class="text-2xl font-bold text-red-400" id="stat-down"></p>
+            </div>
+            <div class="glass p-6 rounded-xl border-b-4 border-blue-500 shadow-md">
+                <p class="text-xs uppercase text-slate-400 mb-1 font-semibold tracking-wider">Avg Uptime</p>
+                <p class="text-2xl font-bold text-blue-400" id="stat-uptime"></p>
+            </div>
+        </div>
+
+        <!-- Service cards -->
+        <div class="mb-2 flex items-center">
+            <h2 class="text-xl font-bold text-white flex items-center"><span class="w-2 h-6 bg-indigo-500 rounded-full mr-3"></span>Services</h2>
+        </div>
+        <div class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4 mt-4" id="cards"></div>
+    </main>
+
+    <script>
+        const REFRESH_MS = 10000;
+
+        const fmtAge = (iso) => {
+            if (!iso) return '—';
+            const ms = Date.now() - new Date(iso).getTime();
+            const m = Math.floor(ms / 60000);
+            if (m < 1) return 'just now';
+            if (m < 60) return m + 'm ago';
+            if (m < 1440) return Math.floor(m / 60) + 'h ' + (m % 60) + 'm ago';
+            return Math.floor(m / 1440) + 'd ago';
+        };
+
+        function sparkline(hist) {
+            if (!hist || !hist.length) return '';
+            return hist.slice(-40).map(v =>
+                `<span class="inline-block w-1 rounded-sm ${v ? 'bg-emerald-500/70' : 'bg-red-500'}" style="height:${v ? 14 : 6}px;vertical-align:bottom;"></span>`
+            ).join('');
+        }
+
+        function showSkeletons() {
+            ['stat-total','stat-up','stat-down','stat-uptime'].forEach(id =>
+                document.getElementById(id).innerHTML = `<span class="skel rounded" style="width:3rem;height:2rem;"></span>`);
+            document.getElementById('cards').innerHTML = Array(6).fill(0).map(() => `
+                <div class="glass p-5 rounded-xl border-l-4 border-slate-700">
+                    <div class="skel rounded mb-3" style="height:1.1rem;width:55%"></div>
+                    <div class="skel rounded mb-2" style="height:.7rem;width:80%"></div>
+                    <div class="skel rounded" style="height:.7rem;width:40%"></div>
+                </div>`).join('');
+        }
+
+        function render(data) {
+            document.getElementById('refreshTime').innerText = 'Updated ' + new Date(data.generated).toLocaleTimeString();
+            document.getElementById('stat-total').innerText = data.summary.total;
+            document.getElementById('stat-up').innerText = data.summary.up;
+            document.getElementById('stat-down').innerText = data.summary.down;
+
+            const ups = data.targets.map(t => t.uptime).filter(v => v !== null);
+            const avg = ups.length ? (ups.reduce((a, b) => a + b, 0) / ups.length) : null;
+            document.getElementById('stat-uptime').innerText = avg === null ? '—' : avg.toFixed(1) + '%';
+
+            // targets with a dedicated detail page
+            const detailPages = { mongodb: './mongo.html', ollama: './ollama.html' };
+
+            document.getElementById('cards').innerHTML = data.targets.map(t => {
+                const up = t.status === 'up';
+                const unknown = t.status === 'unknown';
+                const dot = unknown ? 'bg-slate-500' : (up ? 'bg-emerald-400 live' : 'bg-red-500 live');
+                const border = unknown ? 'border-slate-600' : (up ? 'border-emerald-500' : 'border-red-500');
+                const statusText = unknown ? 'UNKNOWN' : (up ? 'UP' : 'DOWN');
+                const statusColor = unknown ? 'text-slate-400' : (up ? 'text-emerald-400' : 'text-red-400');
+                const lat = t.latency_ms === null ? '—' : t.latency_ms + 'ms';
+                const uptime = t.uptime === null ? '—' : t.uptime + '%';
+                const detail = detailPages[t.name];
+                const clickable = detail
+                    ? `onclick="location.href='${detail}'" class="glass p-5 rounded-xl border-l-4 ${border} shadow-md flex flex-col cursor-pointer hover:bg-slate-800/80 transition-all group"`
+                    : `class="glass p-5 rounded-xl border-l-4 ${border} shadow-md flex flex-col"`;
+                return `
+                <div ${clickable}>
+                    <div class="flex justify-between items-start mb-2">
+                        <div>
+                            <div class="flex items-center gap-2">
+                                <span class="w-2.5 h-2.5 rounded-full ${dot}"></span>
+                                <span class="font-bold text-white text-lg">${t.name}</span>
+                                ${detail ? '<span class="text-slate-500 group-hover:text-emerald-400 transition-colors text-sm">→</span>' : ''}
+                            </div>
+                            ${t.group ? `<p class="text-[10px] uppercase tracking-wider text-slate-500 mt-1 ml-4.5">${t.group}</p>` : ''}
+                        </div>
+                        <span class="text-xs font-bold ${statusColor}">${statusText}</span>
+                    </div>
+                    <p class="text-xs text-slate-400 truncate mb-3" title="${t.label}">${t.label}</p>
+                    <div class="flex items-end gap-0.5 h-4 mb-3">${sparkline(t.spark)}</div>
+                    <div class="flex justify-between text-[11px] text-slate-500 mt-auto">
+                        <span>${lat} · ${t.detail || ''}${detail ? ' · <span class="text-emerald-500/70">details</span>' : ''}</span>
+                        <span>${uptime} · ${fmtAge(t.last_checked)}</span>
+                    </div>
+                </div>`;
+            }).join('');
+        }
+
+        async function load() {
+            try {
+                const res = await fetch('/api/status');
+                if (!res.ok) throw new Error('HTTP ' + res.status);
+                render(await res.json());
+            } catch (err) {
+                document.getElementById('refreshTime').innerText = 'Fetch failed';
+                document.getElementById('refreshTime').className = 'text-sm text-red-400';
+            }
+        }
+
+        showSkeletons();
+        load();
+        setInterval(load, REFRESH_MS);
+    </script>
+</body>
+</html>
