@@ -32,18 +32,19 @@ monitor_host_metrics_host: "{{ monitor_host_142 }}"
 monitor_ssh_key_src: "{{ ansible_env.HOME }}/.ssh/id_rsa"        # key copied into the data dir
 monitor_ssh_known_hosts_src: "{{ ansible_env.HOME }}/.ssh/known_hosts"
 
-# Ollama LLM drill-down — live model state (/api/ps, /api/tags, /api/show) plus a
-# periodic "canary" generation that measures throughput (tok/s), since Ollama has
-# NO passive metrics endpoint. NON-DISRUPTIVE by design: the model is shared with
-# the live agent, so the canary only probes a model that is ALREADY resident and
-# reuses its exact runner (matched num_ctx + keep_alive=-1) — it never loads,
-# reloads, resizes, or unloads anything. If nothing is loaded it skips. Runs on
-# its own thread; persisted to SQLite like the other history.
+# Ollama Cloud (ollama.com) drill-down — live state (/api/version, /api/tags
+# catalog, /api/show on the active model) plus a periodic "canary" generation
+# that measures round-trip throughput (tok/s), since Ollama has NO passive
+# metrics endpoint. NOTE: this is a hosted, SERVERLESS service — there is no
+# resident model / VRAM / keep-alive (those are local-only concepts), and EACH
+# canary is a real BILLED generation against the cloud account. Kept tiny
+# (num_predict) and infrequent (canary_interval) so the cost stays negligible.
+# Runs on its own thread; persisted to SQLite like the other history.
 monitor_ollama_enable: true
-monitor_ollama_host: "{{ monitor_host_127 }}"   # the Ollama box (.127)
-monitor_ollama_port: 11434
-monitor_ollama_model: ""                         # blank = probe whatever is loaded;
-                                                 # set a name to probe ONLY that model
+monitor_ollama_base_url: "https://ollama.com"    # Ollama Cloud endpoint
+monitor_ollama_api_key: "{{ ollama_api_key }}"   # from group_vars/hermes/vault.yml
+monitor_ollama_model: "qwen3-next:80b"           # model to canary (cloud has no
+                                                 # resident model to auto-detect)
 monitor_ollama_canary_interval: 900              # seconds between canaries (15 min)
 monitor_ollama_num_predict: 16                   # tokens generated per canary (tiny)
 
@@ -84,10 +85,12 @@ monitor_targets:
     url: "http://{{ monitor_host_128 }}:8123/"
     expect_status: [200, 401, 403]
 
+  # Ollama Cloud reachability — /api/version answers 200 without auth, so this is
+  # a clean up/down ping (the rich drill-down lives on its own authed thread).
   - name: ollama
-    group: ".127 LLM"
+    group: "ollama cloud"
     type: http
-    url: "http://{{ monitor_host_127 }}:11434/api/tags"
+    url: "https://ollama.com/api/version"
     expect_status: [200]
 
   - name: astonks-api
@@ -96,8 +99,34 @@ monitor_targets:
     url: "http://{{ monitor_host_127 }}:3000/"
     expect_status: [200]
 
+  - name: elasticsearch
+    group: ".127 stonks"
+    type: http
+    url: "http://{{ monitor_host_127 }}:9200/_cluster/health"
+    expect_status: [200]
+
+  - name: kafka
+    group: ".127 stonks"
+    type: tcp
+    host: "{{ monitor_host_127 }}"
+    port: 9092
+
   - name: mongodb
     group: ".142 database"
     type: tcp
     host: "{{ monitor_host_142 }}"
     port: 27017
+
+  # External reachability — confirms .128's uplink is healthy (any HTTP
+  # response = internet up; only DNS/connect failures register as down).
+  - name: google.com
+    group: "internet"
+    type: http
+    url: "https://google.com"
+    expect_status: [200, 301, 302, 401, 403, 404]
+
+  - name: api.massive.com
+    group: "internet"
+    type: http
+    url: "https://api.massive.com"
+    expect_status: [200, 301, 302, 401, 403, 404]

@@ -15,6 +15,11 @@ desired = {
     "provider": {{ hermes_model_provider | to_json }},
     "base_url": {{ hermes_model_base_url | to_json }},
 }
+# Only manage api_key when one is configured (local/keyless endpoints omit it,
+# leaving any existing key in config.yaml untouched).
+{% if hermes_model_api_key | default('') %}
+desired["api_key"] = {{ hermes_model_api_key | to_json }}
+{% endif %}
 
 data = {}
 if os.path.exists(CONFIG):

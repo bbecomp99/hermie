@@ -6,7 +6,8 @@ serves a JSON status API + an astonks-styled dashboard, and posts to Mattermost
 on every up<->down transition. Pure stdlib so the image stays ~50MB.
 
 Config: JSON file at $CONFIG_PATH (default /app/config.json).
-Secrets: Mattermost bot token via $MM_TOKEN (never in the config file).
+Secrets: Mattermost bot token via $MM_TOKEN and the Ollama Cloud key via
+$OLLAMA_API_KEY (never in the config file).
 """
 import json
 import os
@@ -64,12 +65,13 @@ def load_config():
     hm.setdefault("known_hosts", "/app/.ssh/known_hosts")
     ol = cfg.setdefault("ollama", {})
     ol.setdefault("enable", False)
-    ol.setdefault("host", "")
-    ol.setdefault("port", 11434)
-    ol.setdefault("model", "")            # blank → auto (use the loaded model)
+    ol.setdefault("base_url", "")          # Ollama Cloud endpoint (https://ollama.com)
+    # Bearer token injected via env, never persisted in the 0644 config file.
+    ol["api_key"] = os.environ.get("OLLAMA_API_KEY", "")
+    ol.setdefault("model", "")             # model to canary (cloud has no resident)
     ol.setdefault("canary_interval", 900)  # seconds between throughput canaries
     ol.setdefault("num_predict", 16)       # tokens generated per canary
-    ol.setdefault("timeout", 120)          # generous: canary may queue behind agent
+    ol.setdefault("timeout", 120)          # generous: canary may queue server-side
     return cfg
 
 
@@ -146,6 +148,8 @@ class State:
                 "label": t.get("label", _describe(t)),
                 "status": "unknown",   # up | down | unknown
                 "detail": "",
+                "degraded": False,
+                "degraded_detail": "",
                 "latency_ms": None,
                 "since": None,         # ISO ts of the current status
                 "last_checked": None,
@@ -158,6 +162,12 @@ class State:
         with self.lock:
             if name in self.targets and hist:
                 self.targets[name]["history"].extend(hist)
+
+    def set_degraded(self, name, is_degraded, detail=""):
+        with self.lock:
+            if name in self.targets:
+                self.targets[name]["degraded"] = is_degraded
+                self.targets[name]["degraded_detail"] = detail
 
     def update(self, name, ok, latency, detail):
         now = datetime.now(timezone.utc)
@@ -182,17 +192,21 @@ class State:
             for s in self.targets.values():
                 hist = list(s["history"])
                 uptime = round(100 * sum(hist) / len(hist), 1) if hist else None
-                if s["status"] == "up":
+                
+                status_out = "degraded" if s["status"] == "up" and s.get("degraded") else s["status"]
+                detail_out = s["degraded_detail"] if status_out == "degraded" and s.get("degraded_detail") else s["detail"]
+                
+                if status_out in ("up", "degraded"):
                     up += 1
-                elif s["status"] == "down":
+                elif status_out == "down":
                     down += 1
                 out.append({
                     "name": s["name"],
                     "group": s["group"],
                     "kind": s["kind"],
                     "label": s["label"],
-                    "status": s["status"],
-                    "detail": s["detail"],
+                    "status": status_out,
+                    "detail": detail_out,
                     "latency_ms": s["latency_ms"],
                     "since": s["since"],
                     "last_checked": s["last_checked"],
@@ -362,6 +376,7 @@ def monitor_loop(cfg, state, store=None, host_latest=None):
                                     timeout=mongo_t.get("timeout", 5))
             if cur and mongo_prev:
                 degraded, reasons, metrics = eval_mongo_perf(mongo_prev, cur, mp)
+                state.set_degraded(mongo_t["name"], degraded, "; ".join(reasons))
                 print(f"[argus] mongo perf {'DEGRADED' if degraded else 'ok'} "
                       f"{metrics}", flush=True)
                 if store:
@@ -410,41 +425,33 @@ def monitor_loop(cfg, state, store=None, host_latest=None):
 
 
 def canary_loop(cfg, store=None, ollama_latest=None):
-    """Periodically measure Ollama throughput (tok/s) WITHOUT disturbing the
-    shared production model. Only ever probes a model that is already resident,
-    reusing its exact runner (matched num_ctx + keep_alive=-1) — it never loads,
-    reloads, resizes, or unloads anything. Runs on its own thread so a slow /
-    queued generation can't delay the black-box probe cycle.
-
-    monitor_ollama_model (if set) is a filter: probe ONLY when that model is the
-    one loaded; otherwise we probe whatever is loaded."""
+    """Periodically measure Ollama Cloud round-trip throughput (tok/s) by running
+    a tiny generation against the configured model. Cloud is serverless — there's
+    no resident model to detect — and EACH canary is a real billed generation, so
+    it's kept tiny + infrequent. Runs on its own thread so a slow / queued
+    generation can't delay the black-box probe cycle."""
     ol = cfg["ollama"]
     interval = max(60, int(ol.get("canary_interval", 900)))
     timeout = int(ol.get("timeout", 120))
-    want = (ol.get("model") or "").strip()
+    base = ol.get("base_url", "")
+    api_key = ol.get("api_key", "")
+    model = (ol.get("model") or "").strip()
     while True:
-        lm = ollama.loaded(ol["host"], int(ol["port"]), timeout=8)
-        if lm is None:
-            print("[argus] ollama canary skipped — no model resident "
-                  "(won't trigger a load)", flush=True)
-        elif want and want != lm["model"]:
-            print(f"[argus] ollama canary skipped — {lm['model']} loaded, "
-                  f"not {want}", flush=True)
+        if not model:
+            print("[argus] ollama canary skipped — no model configured",
+                  flush=True)
         else:
-            res = ollama.canary(ol["host"], int(ol["port"]), lm["model"],
-                                num_ctx=lm.get("context_length"),
+            res = ollama.canary(base, api_key, model,
                                 num_predict=int(ol.get("num_predict", 16)),
-                                keep_alive=-1, timeout=timeout)
+                                timeout=timeout)
             if res:
-                res["context_length"] = lm.get("context_length")
                 res["fetched"] = datetime.now(timezone.utc).isoformat()
                 if ollama_latest is not None:
                     ollama_latest.clear()
                     ollama_latest.update(res)
                 print(f"[argus] ollama canary {res['model']} "
-                      f"(ctx {lm.get('context_length')}) "
-                      f"eval={res['eval_tps']} tok/s prompt={res['prompt_tps']} "
-                      f"tok/s load={res['load_ms']}ms", flush=True)
+                      f"eval={res['eval_tps']} tok/s "
+                      f"total={res['total_ms']}ms", flush=True)
                 if store:
                     store.insert_ollama_perf(res)
         time.sleep(interval)
@@ -502,11 +509,12 @@ def make_handler(state, cfg, store=None, host_latest=None, ollama_latest=None):
                     self._send(200, json.dumps(
                         store.host_history(hm_host, hours=hours)).encode())
             elif path == "/api/ollama":
-                if not ol_cfg.get("enable") or not ol_cfg.get("host"):
+                if not ol_cfg.get("enable") or not ol_cfg.get("base_url"):
                     self._send(404, b'{"ok":false,"error":"ollama not configured"}')
                 else:
-                    data = ollama.health(ol_cfg["host"], int(ol_cfg["port"]),
-                                         timeout=8)
+                    data = ollama.health(ol_cfg["base_url"],
+                                         ol_cfg.get("api_key", ""),
+                                         ol_cfg.get("model", ""), timeout=8)
                     if ollama_latest:
                         data["canary"] = dict(ollama_latest)
                     self._send(200, json.dumps(data).encode())
@@ -579,7 +587,7 @@ def main():
     # Ollama throughput canary on its own thread (slow generations must not
     # block probes); handler reads the newest sample from ollama_latest.
     ollama_latest = {}
-    if cfg["ollama"]["enable"] and cfg["ollama"]["host"]:
+    if cfg["ollama"]["enable"] and cfg["ollama"]["base_url"]:
         threading.Thread(target=canary_loop,
                          args=(cfg, store, ollama_latest), daemon=True).start()
 

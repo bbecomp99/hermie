@@ -236,39 +236,32 @@
             document.getElementById('statusText').className = 'text-sm font-bold text-emerald-400';
             document.getElementById('statusText').innerText = 'ONLINE';
 
-            const running = d.running || [];
-            const loaded = running[0] || null;
             const cny = d.canary || null;
-            const loadedName = loaded ? (loaded.name || loaded.model) : (d.focus || '—');
+            const show = d.show || null;
+            const caps = (show && show.capabilities) || [];
+            const det = (show && show.details) || {};
+            const mi = (show && show.model_info) || {};
+            const pick = (suffix) => { const k = Object.keys(mi).find(x => x.endsWith(suffix)); return k != null ? mi[k] : null; };
+            const ctx = pick('.context_length');
             document.getElementById('hostline').innerText =
-                `${d.host} · Ollama ${d.version || '?'} · ${running.length} loaded · ${(d.models||[]).length} installed`;
+                `${d.host} · Cloud · Ollama ${d.version || '?'} · ${(d.models||[]).length} models available`;
 
-            // keep-alive: Ollama may pin the model far in the future (years).
-            let keep = '—';
-            if (loaded) {
-                const exp = parseTs(loaded.expires_at);
-                if (exp) {
-                    const secs = (exp - Date.now()) / 1000;
-                    keep = secs > 5 * 365 * 86400 ? 'pinned' : secs <= 0 ? 'expiring' : 'in ' + dur(secs);
-                }
-            }
-
-            // ---- top stats ----
+            // ---- top stats (cloud is serverless — no resident model / VRAM) ----
             const stats = `<div class="grid grid-cols-2 md:grid-cols-4 gap-6 mb-8">
-                ${stat('Version', d.version || '—', 'border-indigo-500', 'ollama server')}
-                ${stat('Loaded model', loaded ? '✓ resident' : 'none', loaded ? 'border-emerald-500' : 'border-slate-600', loadedName)}
-                ${stat('VRAM', loaded ? bytes(loaded.size_vram) : '—', 'border-violet-500', loaded && loaded.size ? bytes(loaded.size) + ' total' : 'not loaded')}
-                ${stat('Context window', loaded && loaded.context_length ? num(loaded.context_length) : '—', 'border-sky-500', 'tokens · keep-alive ' + keep)}
+                ${stat('Endpoint', 'Cloud', 'border-indigo-500', d.host || 'ollama.com')}
+                ${stat('Active model', d.focus || '—', 'border-emerald-500', det.parameter_size ? det.parameter_size + (det.quantization_level ? ' · ' + det.quantization_level : '') : 'configured for the agent')}
+                ${stat('Capabilities', caps.length ? caps.join(' · ') : '—', 'border-violet-500', 'model features')}
+                ${stat('Context window', ctx != null ? num(ctx) : '—', 'border-sky-500', 'tokens')}
             </div>`;
 
-            // ---- Throughput (canary) ----
+            // ---- Throughput (canary) — cloud reports end-to-end timing only ----
             const evalTps = cny ? cny.eval_tps : null;
             const promptTps = cny ? cny.prompt_tps : null;
-            const loadMs = cny ? cny.load_ms : null;
+            const totalMs = cny ? cny.total_ms : null;
             const heroes = `<div class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-4">
-                ${perfHero('Eval throughput', evalTps == null ? '—' : evalTps.toFixed(1) + ' tok/s', tpsColor(evalTps, 60, 30), tpsBorder(evalTps, 60, 30), cny ? 'generation speed' : 'awaiting first canary…')}
-                ${perfHero('Prompt throughput', promptTps == null ? '—' : promptTps.toFixed(1) + ' tok/s', tpsColor(promptTps, 100, 40), tpsBorder(promptTps, 100, 40), cny ? 'prefill speed' : 'awaiting first canary…')}
-                ${perfHero('Load time', loadMs == null ? '—' : (loadMs >= 1000 ? (loadMs/1000).toFixed(1)+' s' : loadMs.toFixed(0)+' ms'), loadMs == null ? 'text-slate-400' : loadMs < 100 ? 'text-emerald-400' : loadMs < 2000 ? 'text-amber-400' : 'text-red-400', loadMs == null ? 'border-slate-600' : loadMs < 100 ? 'border-emerald-500' : loadMs < 2000 ? 'border-amber-500' : 'border-red-500', loadMs != null && loadMs < 100 ? 'model already resident' : 'to ready the model')}
+                ${perfHero('Round-trip throughput', evalTps == null ? '—' : evalTps.toFixed(1) + ' tok/s', tpsColor(evalTps, 60, 30), tpsBorder(evalTps, 60, 30), cny ? 'end-to-end generation' : 'awaiting first canary…')}
+                ${perfHero('Prompt throughput', promptTps == null ? '—' : promptTps.toFixed(1) + ' tok/s', tpsColor(promptTps, 100, 40), tpsBorder(promptTps, 100, 40), cny ? 'prefill speed' : 'cloud may omit')}
+                ${perfHero('Round-trip time', totalMs == null ? '—' : (totalMs >= 1000 ? (totalMs/1000).toFixed(1)+' s' : totalMs.toFixed(0)+' ms'), totalMs == null ? 'text-slate-400' : totalMs < 1500 ? 'text-emerald-400' : totalMs < 5000 ? 'text-amber-400' : 'text-red-400', totalMs == null ? 'border-slate-600' : totalMs < 1500 ? 'border-emerald-500' : totalMs < 5000 ? 'border-amber-500' : 'border-red-500', 'per canary call')}
                 ${perfHero('Last canary', cny && cny.fetched ? new Date(cny.fetched).toLocaleTimeString() : '—', 'text-slate-200', 'border-indigo-500', cny ? `${num(cny.eval_count)} tok generated` : 'every 15 min')}
             </div>`;
 
@@ -287,24 +280,21 @@
             </div>`;
 
             const perfSection = `<div class="mb-2"><h2 class="text-xl font-bold text-white flex items-center"><span class="w-2 h-6 bg-indigo-500 rounded-full mr-3"></span>Throughput</h2>
-                <p class="text-xs text-slate-500 mt-1 ml-5">Ollama has no passive metrics endpoint — these come from a tiny periodic "canary" generation. Falling eval tok/s = the box is under load or the model was evicted from VRAM.</p></div>
+                <p class="text-xs text-slate-500 mt-1 ml-5">Ollama has no passive metrics endpoint — these come from a tiny periodic "canary" generation (a real billed cloud call). Cloud reports only end-to-end timing, so this is round-trip throughput (includes queue + network), not pure decode speed.</p></div>
                 <div class="mt-4">${heroes}${trend}</div>`;
 
             // ---- detail cards ----
             const cards = [];
-            const show = d.show || null;
 
-            cards.push(card('Loaded model', loaded ? 'border-emerald-500' : 'border-slate-600',
-                loaded ? (
-                    row('Name', loadedName) +
-                    row('VRAM resident', bytes(loaded.size_vram)) +
-                    row('Total size', bytes(loaded.size)) +
-                    row('Context window', loaded.context_length ? num(loaded.context_length) : '—') +
-                    row('Keep-alive', keep) +
-                    row('Family', (loaded.details||{}).family || '—') +
-                    row('Parameters', (loaded.details||{}).parameter_size || '—') +
-                    row('Quantization', (loaded.details||{}).quantization_level || '—')
-                ) : '<p class="text-sm text-slate-500 py-4">No model is currently loaded in memory.</p>'
+            cards.push(card('Active model', d.focus ? 'border-emerald-500' : 'border-slate-600',
+                d.focus ? (
+                    row('Name', d.focus) +
+                    row('Family', det.family || '—') +
+                    row('Parameters', det.parameter_size || '—') +
+                    row('Quantization', det.quantization_level || '—') +
+                    row('Context window', ctx != null ? num(ctx) : '—') +
+                    row('Capabilities', caps.length ? caps.join(', ') : '—')
+                ) : '<p class="text-sm text-slate-500 py-4">No model configured.</p>'
             ));
 
             if (show && Object.keys(show.parameters||{}).length) {
@@ -315,9 +305,7 @@
             }
 
             if (show && Object.keys(show.model_info||{}).length) {
-                const mi = show.model_info;
-                // surface the most useful architecture facts first
-                const pick = (suffix) => { const k = Object.keys(mi).find(x => x.endsWith(suffix)); return k ? mi[k] : null; };
+                // surface the most useful architecture facts first (mi/pick from above)
                 const archRows =
                     row('Architecture', pick('.architecture') || '—') +
                     row('Parameters', (pick('.parameter_count') != null ? num(pick('.parameter_count')) : '—')) +
@@ -336,21 +324,20 @@
                 <p class="text-xs text-slate-500 mt-1 ml-5">${show ? 'config & architecture for the active model' : 'model config unavailable'}</p></div>
                 <div class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4 mt-4 mb-8">${cards.join('')}</div>`;
 
-            // ---- installed models table ----
-            const loadedSet = new Set(running.map(m => m.model));
+            // ---- cloud model catalog ----
             const mdRows = (d.models||[]).map(m => {
-                const on = loadedSet.has(m.name);
-                const caps = (m.capabilities||[]).map(c => `<span class="cap">${c}</span>`).join(' ');
+                const on = m.name === d.focus;
+                const capsHtml = (m.capabilities||[]).map(c => `<span class="cap">${c}</span>`).join(' ');
                 return `<tr class="border-b border-slate-800/50 hover:bg-slate-800/60 transition-colors">
-                    <td class="py-3 px-4 font-bold text-white">${on ? '<span class="text-emerald-400 mr-1.5" title="loaded in memory">●</span>' : ''}${m.name}</td>
+                    <td class="py-3 px-4 font-bold text-white">${on ? '<span class="text-emerald-400 mr-1.5" title="active model">●</span>' : ''}${m.name}</td>
                     <td class="py-3 px-4 text-right text-slate-300">${m.parameter_size || '—'}</td>
                     <td class="py-3 px-4 text-right text-violet-300">${m.quantization_level || '—'}</td>
                     <td class="py-3 px-4 text-right text-emerald-300">${bytes(m.size)}</td>
-                    <td class="py-3 px-4">${caps || '<span class="text-slate-600">—</span>'}</td>
+                    <td class="py-3 px-4">${capsHtml || '<span class="text-slate-600">—</span>'}</td>
                     <td class="py-3 px-4 text-right text-slate-400">${fmtMod(m.modified_at)}</td>
                 </tr>`;
-            }).join('') || '<tr><td colspan="6" class="text-center py-8 text-slate-500">No models installed.</td></tr>';
-            const mdTable = `<div class="mb-2"><h2 class="text-xl font-bold text-white flex items-center"><span class="w-2 h-6 bg-emerald-500 rounded-full mr-3"></span>Installed models</h2></div>
+            }).join('') || '<tr><td colspan="6" class="text-center py-8 text-slate-500">No models available.</td></tr>';
+            const mdTable = `<div class="mb-2"><h2 class="text-xl font-bold text-white flex items-center"><span class="w-2 h-6 bg-emerald-500 rounded-full mr-3"></span>Cloud models</h2></div>
                 <div class="glass rounded-xl shadow-xl overflow-x-auto mt-4">
                     <table class="w-full text-left border-collapse">
                         <thead class="bg-slate-900"><tr class="text-xs uppercase tracking-wide text-slate-500 border-b border-slate-700">

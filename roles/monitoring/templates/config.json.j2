@@ -26,8 +26,7 @@
   },
   "ollama": {
     "enable": {{ monitor_ollama_enable | bool | to_json }},
-    "host": {{ monitor_ollama_host | to_json }},
-    "port": {{ monitor_ollama_port }},
+    "base_url": {{ monitor_ollama_base_url | to_json }},
     "model": {{ monitor_ollama_model | to_json }},
     "canary_interval": {{ monitor_ollama_canary_interval }},
     "num_predict": {{ monitor_ollama_num_predict }}

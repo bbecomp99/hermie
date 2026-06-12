@@ -169,11 +169,13 @@
 
             document.getElementById('cards').innerHTML = data.targets.map(t => {
                 const up = t.status === 'up';
+                const down = t.status === 'down';
+                const degraded = t.status === 'degraded';
                 const unknown = t.status === 'unknown';
-                const dot = unknown ? 'bg-slate-500' : (up ? 'bg-emerald-400 live' : 'bg-red-500 live');
-                const border = unknown ? 'border-slate-600' : (up ? 'border-emerald-500' : 'border-red-500');
-                const statusText = unknown ? 'UNKNOWN' : (up ? 'UP' : 'DOWN');
-                const statusColor = unknown ? 'text-slate-400' : (up ? 'text-emerald-400' : 'text-red-400');
+                const dot = unknown ? 'bg-slate-500' : (down ? 'bg-red-500 live' : (degraded ? 'bg-amber-400 live' : 'bg-emerald-400 live'));
+                const border = unknown ? 'border-slate-600' : (down ? 'border-red-500' : (degraded ? 'border-amber-500' : 'border-emerald-500'));
+                const statusText = unknown ? 'UNKNOWN' : (down ? 'DOWN' : (degraded ? 'DEGRADED' : 'UP'));
+                const statusColor = unknown ? 'text-slate-400' : (down ? 'text-red-400' : (degraded ? 'text-amber-400' : 'text-emerald-400'));
                 const lat = t.latency_ms === null ? '—' : t.latency_ms + 'ms';
                 const uptime = t.uptime === null ? '—' : t.uptime + '%';
                 const detail = detailPages[t.name];
