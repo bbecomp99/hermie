@@ -21,7 +21,9 @@ from collections import deque
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+import elastic
 import hoststat
+import kafka
 import mongo
 import ollama
 import store as store_mod
@@ -72,6 +74,20 @@ def load_config():
     ol.setdefault("canary_interval", 900)  # seconds between throughput canaries
     ol.setdefault("num_predict", 16)       # tokens generated per canary
     ol.setdefault("timeout", 120)          # generous: canary may queue server-side
+    es = cfg.setdefault("elastic", {})
+    es.setdefault("enable", False)
+    es.setdefault("url", "")               # ES REST base (http://host:9200)
+    es.setdefault("username", "")          # optional HTTP basic auth (anon by default)
+    es["password"] = os.environ.get("ES_PASSWORD", "")  # injected via env, never in config
+    es.setdefault("heap_pct", 85)          # degrade if any node's JVM heap exceeds this
+    es.setdefault("cpu_pct", 90)           # degrade if any node's CPU exceeds this
+    es.setdefault("degrade_on_yellow", False)  # single-node clusters sit yellow normally
+    kf = cfg.setdefault("kafka", {})
+    kf.setdefault("enable", False)
+    kf.setdefault("host", "")
+    kf.setdefault("port", 9092)
+    kf.setdefault("client_id", "argus")
+    kf.setdefault("min_brokers", 1)        # degrade if fewer brokers than this are up
     return cfg
 
 
@@ -336,7 +352,73 @@ def post_mongo_perf(mm, degraded, reasons):
     post_mattermost(mm, text)
 
 
-def monitor_loop(cfg, state, store=None, host_latest=None):
+def eval_elastic_perf(prev, cur, thr, dt):
+    """Compare two elastic.perf_sample()s → (degraded, reasons, metrics). Cluster
+    RED and saturation (heap / cpu / thread-pool rejections) always degrade; a
+    yellow status (normal for single-node clusters with replicas) only degrades
+    when degrade_on_yellow is set. QPS is derived from cumulative-counter deltas."""
+    m = {
+        "status": cur.get("status"), "nodes": cur.get("nodes"),
+        "unassigned": cur.get("unassigned"), "heap_pct": cur.get("heap_pct"),
+        "cpu_pct": cur.get("cpu_pct"), "search_qps": None, "index_qps": None,
+    }
+    rej = 0
+    if prev and dt > 0:
+        ds = (cur.get("search_total") or 0) - (prev.get("search_total") or 0)
+        di = (cur.get("index_total") or 0) - (prev.get("index_total") or 0)
+        m["search_qps"] = round(ds / dt, 2) if ds >= 0 else None
+        m["index_qps"] = round(di / dt, 2) if di >= 0 else None
+        rej = (cur.get("rejected") or 0) - (prev.get("rejected") or 0)
+
+    reasons = []
+    st = cur.get("status")
+    if st == "red":
+        reasons.append("cluster status RED")
+    elif st == "yellow" and thr.get("degrade_on_yellow"):
+        reasons.append("cluster status yellow")
+        if (cur.get("unassigned") or 0) > 0:
+            reasons.append(f"{cur['unassigned']} unassigned shard(s)")
+    if cur.get("heap_pct") is not None and cur["heap_pct"] > thr["heap_pct"]:
+        reasons.append(f"heap {cur['heap_pct']:.0f}% (>{thr['heap_pct']})")
+    if cur.get("cpu_pct") is not None and cur["cpu_pct"] > thr["cpu_pct"]:
+        reasons.append(f"cpu {cur['cpu_pct']:.0f}% (>{thr['cpu_pct']})")
+    if rej > 0:
+        reasons.append(f"{rej} thread-pool rejection(s)")
+    return bool(reasons), reasons, m
+
+
+def eval_kafka_perf(cur, thr):
+    """Derive (degraded, reasons, metrics) from a kafka.perf_sample(). All signals
+    are instantaneous (no deltas): offline / under-replicated partitions, a missing
+    controller, or a shrunken broker count."""
+    m = {k: cur.get(k) for k in
+         ("brokers", "topics", "partitions", "under_replicated", "offline")}
+    reasons = []
+    if (cur.get("offline") or 0) > 0:
+        reasons.append(f"{cur['offline']} offline partition(s)")
+    if (cur.get("under_replicated") or 0) > 0:
+        reasons.append(f"{cur['under_replicated']} under-replicated partition(s)")
+    if not cur.get("has_controller"):
+        reasons.append("no active controller")
+    if cur.get("brokers") is not None and cur["brokers"] < thr["min_brokers"]:
+        reasons.append(f"only {cur['brokers']} broker(s) (<{thr['min_brokers']})")
+    return bool(reasons), reasons, m
+
+
+def post_perf(mm, name, degraded, reasons):
+    """Mattermost transition alert for a service's degraded<->healthy flip."""
+    if not mm.get("enable"):
+        return
+    if degraded:
+        text = f"👁 **Argus** · :warning: **{name} degraded** — " + "; ".join(reasons)
+    else:
+        text = (f"👁 **Argus** · :large_green_circle: **{name} recovered** — "
+                "back to normal")
+    post_mattermost(mm, text)
+
+
+def monitor_loop(cfg, state, store=None, host_latest=None,
+                 elastic_latest=None, kafka_latest=None):
     targets = {t["name"]: t for t in cfg["targets"]}
     interval = cfg["interval"]
     hb_interval = cfg["heartbeat_interval"]
@@ -344,10 +426,15 @@ def monitor_loop(cfg, state, store=None, host_latest=None):
     mm = cfg["mattermost"]
     mp = cfg["mongo_perf"]
     hm = cfg["host_metrics"]
+    es = cfg["elastic"]
+    kf = cfg["kafka"]
     mongo_t = next((t for t in cfg["targets"]
                     if t["type"] == "tcp" and "mongo" in t["name"].lower()), None)
     mongo_prev = None      # previous perf_sample for delta-based latency
     mongo_degraded = False  # last posted state (alert only on transitions)
+    es_prev = None         # previous ES perf_sample for delta-based QPS
+    es_degraded = False
+    kafka_degraded = False
     # Count the heartbeat clock from startup, so the first one lands a full
     # interval in (no spam on every redeploy/restart).
     last_heartbeat = time.monotonic()
@@ -391,6 +478,56 @@ def monitor_loop(cfg, state, store=None, host_latest=None):
                             else "recovered")
             if cur:
                 mongo_prev = cur
+
+        if es["enable"] and es["url"]:
+            cur = elastic.perf_sample(es["url"], es.get("username", ""),
+                                      es.get("password", ""), timeout=8)
+            if cur:
+                degraded, reasons, metrics = eval_elastic_perf(
+                    es_prev, cur, es, dt=interval)
+                state.set_degraded("elasticsearch", degraded, "; ".join(reasons))
+                if elastic_latest is not None:
+                    elastic_latest.clear()
+                    elastic_latest.update(metrics)
+                print(f"[argus] elastic {cur.get('status')} heap={cur.get('heap_pct')}% "
+                      f"cpu={cur.get('cpu_pct')}% unassigned={cur.get('unassigned')}"
+                      f"{' DEGRADED' if degraded else ''}", flush=True)
+                if store:
+                    store.insert_elastic_perf(metrics)
+                if degraded != es_degraded:
+                    es_degraded = degraded
+                    post_perf(mm, "Elasticsearch", degraded, reasons)
+                    if store:
+                        store.insert_event(
+                            "elasticsearch", "perf",
+                            ("degraded: " + "; ".join(reasons)) if degraded
+                            else "recovered")
+                es_prev = cur
+
+        if kf["enable"] and kf["host"]:
+            cur = kafka.perf_sample(kf["host"], int(kf["port"]),
+                                    kf.get("client_id", "argus"), timeout=5)
+            if cur:
+                degraded, reasons, metrics = eval_kafka_perf(cur, kf)
+                state.set_degraded("kafka", degraded, "; ".join(reasons))
+                if kafka_latest is not None:
+                    kafka_latest.clear()
+                    kafka_latest.update(cur)
+                print(f"[argus] kafka brokers={cur.get('brokers')} "
+                      f"partitions={cur.get('partitions')} "
+                      f"under_repl={cur.get('under_replicated')} "
+                      f"offline={cur.get('offline')}"
+                      f"{' DEGRADED' if degraded else ''}", flush=True)
+                if store:
+                    store.insert_kafka_perf(metrics)
+                if degraded != kafka_degraded:
+                    kafka_degraded = degraded
+                    post_perf(mm, "Kafka", degraded, reasons)
+                    if store:
+                        store.insert_event(
+                            "kafka", "perf",
+                            ("degraded: " + "; ".join(reasons)) if degraded
+                            else "recovered")
 
         if hm["enable"] and hm["ssh_host"]:
             hs = hoststat.sample(hm["ssh_user"], hm["ssh_host"],
@@ -462,13 +599,16 @@ def canary_loop(cfg, store=None, ollama_latest=None):
 # ---------------------------------------------------------------------------
 
 
-def make_handler(state, cfg, store=None, host_latest=None, ollama_latest=None):
+def make_handler(state, cfg, store=None, host_latest=None, ollama_latest=None,
+                 elastic_latest=None, kafka_latest=None):
     # The mongo detail endpoint targets the first tcp probe named like "mongo".
     mongo_target = next(
         (t for t in cfg["targets"]
          if t["type"] == "tcp" and "mongo" in t["name"].lower()), None)
     hm_host = cfg["host_metrics"].get("ssh_host", "")
     ol_cfg = cfg["ollama"]
+    es_cfg = cfg["elastic"]
+    kf_cfg = cfg["kafka"]
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *args):  # silence per-request logging
@@ -526,6 +666,38 @@ def make_handler(state, cfg, store=None, host_latest=None, ollama_latest=None):
                     hours = float(q.get("hours", ["24"])[0])
                     self._send(200, json.dumps(
                         store.ollama_history(hours=hours)).encode())
+            elif path == "/api/elastic":
+                if not es_cfg.get("enable") or not es_cfg.get("url"):
+                    self._send(404, b'{"ok":false,"error":"elasticsearch not configured"}')
+                else:
+                    data = elastic.health(es_cfg["url"], es_cfg.get("username", ""),
+                                          es_cfg.get("password", ""), timeout=8)
+                    if elastic_latest:
+                        data["rates"] = dict(elastic_latest)
+                    self._send(200, json.dumps(data).encode())
+            elif path == "/api/elastic/history":
+                if store is None:
+                    self._send(200, b"[]")
+                else:
+                    q = self._query()
+                    hours = float(q.get("hours", ["6"])[0])
+                    self._send(200, json.dumps(
+                        store.elastic_history(hours=hours)).encode())
+            elif path == "/api/kafka":
+                if not kf_cfg.get("enable") or not kf_cfg.get("host"):
+                    self._send(404, b'{"ok":false,"error":"kafka not configured"}')
+                else:
+                    data = kafka.health(kf_cfg["host"], int(kf_cfg["port"]),
+                                        kf_cfg.get("client_id", "argus"), timeout=5)
+                    self._send(200, json.dumps(data).encode())
+            elif path == "/api/kafka/history":
+                if store is None:
+                    self._send(200, b"[]")
+                else:
+                    q = self._query()
+                    hours = float(q.get("hours", ["6"])[0])
+                    self._send(200, json.dumps(
+                        store.kafka_history(hours=hours)).encode())
             elif path == "/api/mongo/history":
                 if store is None:
                     self._send(200, b"[]")
@@ -579,9 +751,13 @@ def main():
         print(f"[argus] persistence DISABLED: {type(exc).__name__}: {exc}", flush=True)
         store = None
 
-    host_latest = {}  # shared: loop writes the newest host CPU/mem, handler reads
-    t = threading.Thread(target=monitor_loop,
-                         args=(cfg, state, store, host_latest), daemon=True)
+    host_latest = {}     # shared: loop writes the newest host CPU/mem, handler reads
+    elastic_latest = {}  # shared: loop writes derived ES rates, handler attaches them
+    kafka_latest = {}    # shared: loop writes the newest Kafka summary counts
+    t = threading.Thread(
+        target=monitor_loop,
+        args=(cfg, state, store, host_latest, elastic_latest, kafka_latest),
+        daemon=True)
     t.start()
 
     # Ollama throughput canary on its own thread (slow generations must not
@@ -595,10 +771,12 @@ def main():
     print(f"[argus] serving on :{port}, {len(cfg['targets'])} targets, "
           f"interval={cfg['interval']}s, mattermost={cfg['mattermost']['enable']}, "
           f"host_metrics={cfg['host_metrics']['enable']}, "
-          f"ollama={cfg['ollama']['enable']}", flush=True)
+          f"ollama={cfg['ollama']['enable']}, elastic={cfg['elastic']['enable']}, "
+          f"kafka={cfg['kafka']['enable']}", flush=True)
     ThreadingHTTPServer(("0.0.0.0", port),
                         make_handler(state, cfg, store, host_latest,
-                                     ollama_latest)).serve_forever()
+                                     ollama_latest, elastic_latest,
+                                     kafka_latest)).serve_forever()
 
 
 if __name__ == "__main__":

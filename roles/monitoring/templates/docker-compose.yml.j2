@@ -12,6 +12,7 @@ services:
       # Secrets injected at runtime — kept out of config.json (0644) and the image.
       MM_TOKEN: "{{ monitor_mm_token }}"
       OLLAMA_API_KEY: "{{ monitor_ollama_api_key }}"
+      ES_PASSWORD: "{{ monitor_elastic_password }}"
     volumes:
       - {{ monitor_dir }}/config.json:/app/config.json:ro
       # Persisted SQLite history — survives container rebuild/redeploy.

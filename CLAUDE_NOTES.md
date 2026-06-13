@@ -3,6 +3,51 @@
 Running notes for the `hermie` repo so I can catch myself up across sessions.
 Newest context at the top of each section. **No secrets in this file.**
 
+## 2026-06-13 — Argus: Elasticsearch + Kafka drill-down pages
+- Added two full detail pages (drill-in from the index cards, like Mongo/Ollama):
+  **`elastic.html`** (teal accent, 🔎) and **`kafka.html`** (copper accent, "K"
+  medallion). Wired into `index.html`'s `detailPages` map by target name
+  (`elasticsearch` → `./elastic.html`, `kafka` → `./kafka.html`).
+- **New pure-stdlib clients** mirroring `mongo.py`/`ollama.py`:
+  - `elastic.py` — ES REST API (HTTP/JSON, the easy one). `health()` pulls
+    `/`, `/_cluster/health`, `/_cluster/stats`, `/_nodes/stats/...`,
+    `/_cat/indices` and curates: cluster status (green/yellow/red), shard
+    allocation, docs/store, per-node heap/cpu/gc/thread-pools/breakers/fds, and a
+    per-index table. Optional HTTP basic auth (username + `ES_PASSWORD` env);
+    the .127 target is anonymous http so it defaults off. `perf_sample()` is a
+    cheap 2-call (health + node stats) snapshot for the loop.
+  - `kafka.py` — **hand-rolled Kafka wire protocol** (binary TCP, no client lib;
+    same spirit as mongo's OP_MSG). Two requests on PRE-FLEXIBLE versions so
+    parsing stays trivial: **ApiVersions v0** (key 18) + **Metadata v1** (key 3,
+    topics=null → all). Derives the classic health signals from metadata:
+    brokers, active controller, topics/partitions, **under-replicated** (ISR <
+    replicas) and **offline** (no leader) partitions, plus per-broker leader
+    counts. Assumes a PLAINTEXT listener. Round-trip + curation unit-tested
+    locally (synthetic frames) before wiring.
+- **Backend wiring** (`app.py`): `/api/elastic` + `/api/kafka` (live) and
+  `/api/elastic/history` + `/api/kafka/history` (SQLite trends). Loop samples
+  both each cycle → `elastic_perf` / `kafka_perf` tables (new in `store.py`,
+  added to prune), computes ES search/index **QPS from counter deltas** (stored +
+  exposed live via `elastic_latest` → `data.rates`), and posts Mattermost
+  **degraded↔recovered** transition alerts (reusing `post_perf`). Degrade rules:
+  ES → RED status / heap>`heap_pct` / cpu>`cpu_pct` / thread-pool rejections
+  always; **yellow only when `monitor_elastic_degrade_on_yellow`** (default
+  false — single-node clusters sit yellow as steady state). Kafka → offline or
+  under-replicated partitions / missing controller / brokers < `min_brokers`.
+- Charts: ES page trends **max heap% + cpu%** (fixed 0–100 axis); Kafka page
+  trends **under-replicated + offline** partition counts (auto-scaled). Both have
+  the 1H/6H/1D/1W range selector pattern from the Ollama page.
+- **Config**: `monitor_elastic_*` / `monitor_kafka_*` in `defaults/main.yml`,
+  rendered into `config.json.j2`; `ES_PASSWORD` added to `docker-compose.yml.j2`
+  env (alongside MM_TOKEN / OLLAMA_API_KEY); `Dockerfile` COPY now includes
+  `elastic.py kafka.py`. Both default **enabled** against `.127` (`:9200` /
+  `:9092`). Verified: full server boots, serves both pages (200), endpoints
+  return clean `ok:false` on unreachable, eval logic + QPS deltas correct.
+- ⚠️ **Not yet deployed / not integration-tested against the REAL .127 ES &
+  Kafka** — only local unit/smoke tests (couldn't reach .127 from here). First
+  deploy (`--tags monitoring`, needs pinky sudo) is the real validation; watch
+  for ES security-on (would need https+auth) or a non-PLAINTEXT Kafka listener.
+
 ## 2026-06-07 — Argus: split host charts + cleared latency history
 - Per user, **split the combined host CPU+Mem dual-line chart into two separate
   single-line charts** (`#cpuChart` gold, `#memChart` sky), side-by-side under the

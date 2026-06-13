@@ -38,6 +38,18 @@ CREATE TABLE IF NOT EXISTS ollama_perf (
     load_ms REAL, total_ms REAL, eval_count INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_ollama_ts ON ollama_perf(ts);
+
+CREATE TABLE IF NOT EXISTS elastic_perf (
+    ts INTEGER NOT NULL, status TEXT, nodes INTEGER, unassigned INTEGER,
+    heap_pct REAL, cpu_pct REAL, search_qps REAL, index_qps REAL
+);
+CREATE INDEX IF NOT EXISTS idx_elastic_ts ON elastic_perf(ts);
+
+CREATE TABLE IF NOT EXISTS kafka_perf (
+    ts INTEGER NOT NULL, brokers INTEGER, topics INTEGER, partitions INTEGER,
+    under_replicated INTEGER, offline INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_kafka_ts ON kafka_perf(ts);
 """
 
 
@@ -93,6 +105,25 @@ class Store:
                  m.get("eval_count")))
             self._db.commit()
 
+    def insert_elastic_perf(self, m):
+        with self._lock:
+            self._db.execute(
+                "INSERT INTO elastic_perf(ts,status,nodes,unassigned,heap_pct,"
+                "cpu_pct,search_qps,index_qps) VALUES(?,?,?,?,?,?,?,?)",
+                (int(time.time()), m.get("status"), m.get("nodes"),
+                 m.get("unassigned"), m.get("heap_pct"), m.get("cpu_pct"),
+                 m.get("search_qps"), m.get("index_qps")))
+            self._db.commit()
+
+    def insert_kafka_perf(self, m):
+        with self._lock:
+            self._db.execute(
+                "INSERT INTO kafka_perf(ts,brokers,topics,partitions,"
+                "under_replicated,offline) VALUES(?,?,?,?,?,?)",
+                (int(time.time()), m.get("brokers"), m.get("topics"),
+                 m.get("partitions"), m.get("under_replicated"), m.get("offline")))
+            self._db.commit()
+
     def insert_event(self, target, kind, detail):
         with self._lock:
             self._db.execute(
@@ -104,7 +135,7 @@ class Store:
         cutoff = int(time.time()) - days * 86400
         with self._lock:
             for tbl in ("samples", "mongo_perf", "events", "host_metrics",
-                        "ollama_perf"):
+                        "ollama_perf", "elastic_perf", "kafka_perf"):
                 self._db.execute(f"DELETE FROM {tbl} WHERE ts<?", (cutoff,))
             self._db.commit()
 
@@ -133,6 +164,23 @@ class Store:
             "ORDER BY ts", (since,), limit)
         return [{"ts": r[0], "eval_tps": r[1], "prompt_tps": r[2],
                  "load_ms": r[3]} for r in rows]
+
+    def elastic_history(self, hours=6, limit=1000):
+        since = int(time.time()) - int(hours * 3600)
+        rows = self._range(
+            "SELECT ts,status,nodes,unassigned,heap_pct,cpu_pct,search_qps,"
+            "index_qps FROM elastic_perf WHERE ts>=? ORDER BY ts", (since,), limit)
+        return [{"ts": r[0], "status": r[1], "nodes": r[2], "unassigned": r[3],
+                 "heap_pct": r[4], "cpu_pct": r[5], "search_qps": r[6],
+                 "index_qps": r[7]} for r in rows]
+
+    def kafka_history(self, hours=6, limit=1000):
+        since = int(time.time()) - int(hours * 3600)
+        rows = self._range(
+            "SELECT ts,brokers,topics,partitions,under_replicated,offline "
+            "FROM kafka_perf WHERE ts>=? ORDER BY ts", (since,), limit)
+        return [{"ts": r[0], "brokers": r[1], "topics": r[2], "partitions": r[3],
+                 "under_replicated": r[4], "offline": r[5]} for r in rows]
 
     def history(self, target, hours=24, limit=2000):
         since = int(time.time()) - int(hours * 3600)

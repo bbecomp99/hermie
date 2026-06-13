@@ -48,6 +48,35 @@ monitor_ollama_model: "qwen3-next:80b"           # model to canary (cloud has no
 monitor_ollama_canary_interval: 900              # seconds between canaries (15 min)
 monitor_ollama_num_predict: 16                   # tokens generated per canary (tiny)
 
+# Elasticsearch drill-down — live cluster/node/index state via the ES REST API
+# (cluster health, /_cluster/stats, per-node /_nodes/stats: heap, cpu, gc, thread
+# pools, circuit breakers, /_cat/indices). Each probe cycle also samples the
+# saturation primitives into SQLite for trend charts, and posts a Mattermost
+# alert on transition into/out of "degraded". RED status + heap/cpu over the
+# ceilings + thread-pool rejections always degrade; a yellow cluster only degrades
+# when monitor_elastic_degrade_on_yellow is true (single-node clusters with
+# replicas sit yellow as their normal steady state). The .127 target runs http
+# with security disabled, so basic-auth creds default empty.
+monitor_elastic_enable: true
+monitor_elastic_url: "http://{{ monitor_host_127 }}:9200"
+monitor_elastic_username: ""                      # optional HTTP basic auth user
+monitor_elastic_password: ""                      # injected via ES_PASSWORD env (vault if set)
+monitor_elastic_heap_pct: 85                      # degrade if any node's JVM heap > this
+monitor_elastic_cpu_pct: 90                       # degrade if any node's CPU > this
+monitor_elastic_degrade_on_yellow: false          # don't sit amber on expected single-node yellow
+
+# Kafka drill-down — speaks the Kafka wire protocol directly (no client lib) to
+# pull cluster metadata: brokers, active controller, topics, partitions, ISR.
+# From that Argus derives the classic health signals — under-replicated and
+# offline partitions, broker count, controller presence — sampled each cycle into
+# SQLite and alerted on transition into/out of "degraded". Assumes a PLAINTEXT
+# listener (the LAN target); no TLS/SASL.
+monitor_kafka_enable: true
+monitor_kafka_host: "{{ monitor_host_127 }}"
+monitor_kafka_port: 9092
+monitor_kafka_client_id: "argus"
+monitor_kafka_min_brokers: 1                       # degrade if fewer brokers than this are up
+
 # LAN hosts (kept as vars so the target list below stays readable).
 monitor_host_128: "192.168.88.128"              # the agent box (this host)
 monitor_host_127: "192.168.88.127"              # the Mac dev box
