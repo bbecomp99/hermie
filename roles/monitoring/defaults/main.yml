@@ -172,3 +172,9 @@ monitor_targets:
     type: http
     url: "https://api.massive.com"
     expect_status: [200, 301, 302, 401, 403, 404]
+
+  - name: starlink.com
+    group: "internet"
+    type: http
+    url: "https://starlink.com"
+    expect_status: [200, 301, 302, 401, 403, 404]
