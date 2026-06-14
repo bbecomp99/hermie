@@ -164,45 +164,91 @@
             const avg = ups.length ? (ups.reduce((a, b) => a + b, 0) / ups.length) : null;
             document.getElementById('stat-uptime').innerText = avg === null ? '—' : avg.toFixed(1) + '%';
 
-            // targets with a dedicated detail page
-            const detailPages = { mongodb: './mongo.html', ollama: './ollama.html', elasticsearch: './elastic.html', kafka: './kafka.html' };
+            // The internet-group URL trackers collapse into one merged "Internet QoS"
+            // card (drill-down lives on internet.html); everything else renders 1:1.
+            const internet = data.targets.filter(t => (t.group || '') === 'internet');
+            const others = data.targets.filter(t => (t.group || '') !== 'internet');
+            let html = others.map(renderCard).join('');
+            if (internet.length) html += renderInternetCard(internet);
+            document.getElementById('cards').innerHTML = html;
+        }
 
-            document.getElementById('cards').innerHTML = data.targets.map(t => {
-                const up = t.status === 'up';
-                const down = t.status === 'down';
-                const degraded = t.status === 'degraded';
-                const unknown = t.status === 'unknown';
-                const dot = unknown ? 'bg-slate-500' : (down ? 'bg-red-500 live' : (degraded ? 'bg-amber-400 live' : 'bg-emerald-400 live'));
-                const border = unknown ? 'border-slate-600' : (down ? 'border-red-500' : (degraded ? 'border-amber-500' : 'border-emerald-500'));
-                const statusText = unknown ? 'UNKNOWN' : (down ? 'DOWN' : (degraded ? 'DEGRADED' : 'UP'));
-                const statusColor = unknown ? 'text-slate-400' : (down ? 'text-red-400' : (degraded ? 'text-amber-400' : 'text-emerald-400'));
-                const lat = t.latency_ms === null ? '—' : t.latency_ms + 'ms';
-                const uptime = t.uptime === null ? '—' : t.uptime + '%';
-                const detail = detailPages[t.name];
-                const clickable = detail
-                    ? `onclick="location.href='${detail}'" class="glass p-5 rounded-xl border-l-4 ${border} shadow-md flex flex-col cursor-pointer hover:bg-slate-800/80 transition-all group"`
-                    : `class="glass p-5 rounded-xl border-l-4 ${border} shadow-md flex flex-col"`;
-                return `
-                <div ${clickable}>
-                    <div class="flex justify-between items-start mb-2">
-                        <div>
-                            <div class="flex items-center gap-2">
-                                <span class="w-2.5 h-2.5 rounded-full ${dot}"></span>
-                                <span class="font-bold text-white text-lg">${t.name}</span>
-                                ${detail ? '<span class="text-slate-500 group-hover:text-emerald-400 transition-colors text-sm">→</span>' : ''}
-                            </div>
-                            ${t.group ? `<p class="text-[10px] uppercase tracking-wider text-slate-500 mt-1 ml-4.5">${t.group}</p>` : ''}
+        // targets with a dedicated detail page
+        const detailPages = { mongodb: './mongo.html', ollama: './ollama.html', elasticsearch: './elastic.html', kafka: './kafka.html' };
+
+        function renderCard(t) {
+            const down = t.status === 'down';
+            const degraded = t.status === 'degraded';
+            const unknown = t.status === 'unknown';
+            const dot = unknown ? 'bg-slate-500' : (down ? 'bg-red-500 live' : (degraded ? 'bg-amber-400 live' : 'bg-emerald-400 live'));
+            const border = unknown ? 'border-slate-600' : (down ? 'border-red-500' : (degraded ? 'border-amber-500' : 'border-emerald-500'));
+            const statusText = unknown ? 'UNKNOWN' : (down ? 'DOWN' : (degraded ? 'DEGRADED' : 'UP'));
+            const statusColor = unknown ? 'text-slate-400' : (down ? 'text-red-400' : (degraded ? 'text-amber-400' : 'text-emerald-400'));
+            const lat = t.latency_ms === null ? '—' : t.latency_ms + 'ms';
+            const uptime = t.uptime === null ? '—' : t.uptime + '%';
+            const detail = detailPages[t.name];
+            const clickable = detail
+                ? `onclick="location.href='${detail}'" class="glass p-5 rounded-xl border-l-4 ${border} shadow-md flex flex-col cursor-pointer hover:bg-slate-800/80 transition-all group"`
+                : `class="glass p-5 rounded-xl border-l-4 ${border} shadow-md flex flex-col"`;
+            return `
+            <div ${clickable}>
+                <div class="flex justify-between items-start mb-2">
+                    <div>
+                        <div class="flex items-center gap-2">
+                            <span class="w-2.5 h-2.5 rounded-full ${dot}"></span>
+                            <span class="font-bold text-white text-lg">${t.name}</span>
+                            ${detail ? '<span class="text-slate-500 group-hover:text-emerald-400 transition-colors text-sm">→</span>' : ''}
                         </div>
-                        <span class="text-xs font-bold ${statusColor}">${statusText}</span>
+                        ${t.group ? `<p class="text-[10px] uppercase tracking-wider text-slate-500 mt-1 ml-4.5">${t.group}</p>` : ''}
                     </div>
-                    <p class="text-xs text-slate-400 truncate mb-3" title="${t.label}">${t.label}</p>
-                    <div class="flex items-end gap-0.5 h-4 mb-3">${sparkline(t.spark)}</div>
-                    <div class="flex justify-between text-[11px] text-slate-500 mt-auto">
-                        <span>${lat} · ${t.detail || ''}${detail ? ' · <span class="text-emerald-500/70">details</span>' : ''}</span>
-                        <span>${uptime} · ${fmtAge(t.last_checked)}</span>
+                    <span class="text-xs font-bold ${statusColor}">${statusText}</span>
+                </div>
+                <p class="text-xs text-slate-400 truncate mb-3" title="${t.label}">${t.label}</p>
+                <div class="flex items-end gap-0.5 h-4 mb-3">${sparkline(t.spark)}</div>
+                <div class="flex justify-between text-[11px] text-slate-500 mt-auto">
+                    <span>${lat} · ${t.detail || ''}${detail ? ' · <span class="text-emerald-500/70">details</span>' : ''}</span>
+                    <span>${uptime} · ${fmtAge(t.last_checked)}</span>
+                </div>
+            </div>`;
+        }
+
+        function renderInternetCard(group) {
+            const anyDown = group.some(t => t.status === 'down');
+            const anyDeg = group.some(t => t.status === 'degraded');
+            const allUnknown = group.every(t => t.status === 'unknown');
+            const dot = allUnknown ? 'bg-slate-500' : (anyDown ? 'bg-red-500 live' : (anyDeg ? 'bg-amber-400 live' : 'bg-emerald-400 live'));
+            const border = allUnknown ? 'border-slate-600' : (anyDown ? 'border-red-500' : (anyDeg ? 'border-amber-500' : 'border-emerald-500'));
+            const statusText = allUnknown ? 'UNKNOWN' : (anyDown ? 'DEGRADED' : (anyDeg ? 'SLOW' : 'UP'));
+            const statusColor = allUnknown ? 'text-slate-400' : (anyDown ? 'text-red-400' : (anyDeg ? 'text-amber-400' : 'text-emerald-400'));
+            const lats = group.map(t => t.latency_ms).filter(v => v !== null);
+            const avgLat = lats.length ? Math.round(lats.reduce((a, b) => a + b, 0) / lats.length) : null;
+            const ups = group.map(t => t.uptime).filter(v => v !== null);
+            const avgUp = ups.length ? (ups.reduce((a, b) => a + b, 0) / ups.length).toFixed(1) : null;
+            const upCount = group.filter(t => t.status === 'up' || t.status === 'degraded').length;
+            const chips = group.map(t => {
+                const c = t.status === 'down' ? 'text-red-400' : t.status === 'degraded' ? 'text-amber-400' : t.status === 'unknown' ? 'text-slate-500' : 'text-emerald-400';
+                return `<span class="${c}">●</span> ${t.name}`;
+            }).join('<span class="text-slate-700 mx-1.5">·</span>');
+            return `
+            <div onclick="location.href='./internet.html'" class="glass p-5 rounded-xl border-l-4 ${border} shadow-md flex flex-col cursor-pointer hover:bg-slate-800/80 transition-all group">
+                <div class="flex justify-between items-start mb-2">
+                    <div>
+                        <div class="flex items-center gap-2">
+                            <span class="w-2.5 h-2.5 rounded-full ${dot}"></span>
+                            <span class="font-bold text-white text-lg">Internet QoS</span>
+                            <span class="text-slate-500 group-hover:text-emerald-400 transition-colors text-sm">→</span>
+                        </div>
+                        <p class="text-[10px] uppercase tracking-wider text-slate-500 mt-1 ml-4.5">global url trackers</p>
                     </div>
-                </div>`;
-            }).join('');
+                    <span class="text-xs font-bold ${statusColor}">${statusText}</span>
+                </div>
+                <p class="text-xs text-slate-400 truncate mb-3">${chips}</p>
+                <div class="flex items-end gap-0.5 h-4 mb-3">${sparkline(group[0] ? group[0].spark : [])}</div>
+                <div class="flex justify-between text-[11px] text-slate-500 mt-auto">
+                    <span>${group.length} endpoints${avgLat === null ? '' : ' · avg ' + avgLat + 'ms'} · <span class="text-emerald-500/70">details</span></span>
+                    <span>${avgUp === null ? '—' : avgUp + '%'}</span>
+                </div>
+            </div>`;
         }
 
         async function load() {

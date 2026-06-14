@@ -77,6 +77,19 @@ monitor_kafka_port: 9092
 monitor_kafka_client_id: "argus"
 monitor_kafka_min_brokers: 1                       # degrade if fewer brokers than this are up
 
+# Internet QoS — "Global URL trackers". The internet-group HTTP probes in
+# monitor_targets below double as a quality-of-service panel: their per-cycle
+# latency + up/down samples (already persisted to the samples table) are
+# aggregated into the Internet QoS drill-down — uptime %, avg/p95 latency,
+# jitter, and a merged latency trend per URL. A reachable-but-slow URL (latency
+# over degrade_ms) marks the whole panel "degraded" (amber) and posts a single
+# Mattermost degraded<->recovered transition (panel-level, not per URL). Add URLs
+# by appending more probes with group: "internet".
+monitor_internet_enable: true
+monitor_internet_group: "internet"     # probe group that feeds the QoS panel
+monitor_internet_poor_ms: 400          # latency above this is "poor" (amber on the page)
+monitor_internet_degrade_ms: 800       # reachable but slower than this => panel degraded
+
 # LAN hosts (kept as vars so the target list below stays readable).
 monitor_host_128: "192.168.88.128"              # the agent box (this host)
 monitor_host_127: "192.168.88.127"              # the Mac dev box

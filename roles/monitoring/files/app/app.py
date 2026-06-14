@@ -88,6 +88,11 @@ def load_config():
     kf.setdefault("port", 9092)
     kf.setdefault("client_id", "argus")
     kf.setdefault("min_brokers", 1)        # degrade if fewer brokers than this are up
+    it = cfg.setdefault("internet", {})
+    it.setdefault("enable", False)
+    it.setdefault("group", "internet")     # probe group that feeds the QoS panel
+    it.setdefault("poor_ms", 400)          # latency above this is "poor" (amber)
+    it.setdefault("degrade_ms", 800)       # reachable but slower than this => degraded
     return cfg
 
 
@@ -243,6 +248,96 @@ def _describe(t):
     if t["type"] == "tcp":
         return f"tcp://{t['host']}:{t['port']}"
     return t["type"]
+
+
+# ---------------------------------------------------------------------------
+# Internet QoS — aggregate the "internet"-group probes into a quality-of-service
+# view (uptime, avg/p95 latency, jitter). No new sampling or table: the per-cycle
+# status + latency_ms for these targets is already persisted to `samples`, so the
+# QoS stats are computed straight from store.history().
+# ---------------------------------------------------------------------------
+
+
+def _percentile(values, pct):
+    """Linear-interpolated percentile of a value list (values need not be sorted)."""
+    if not values:
+        return None
+    s = sorted(values)
+    k = (len(s) - 1) * pct / 100.0
+    f = int(k)
+    c = min(f + 1, len(s) - 1)
+    if f == c:
+        return s[f]
+    return s[f] + (s[c] - s[f]) * (k - f)
+
+
+def _qos_stats(store, name, hours):
+    """QoS aggregates for one URL from the samples table: uptime %, latency
+    avg/min/max/p95, and jitter (mean abs delta between consecutive latencies).
+    Latency stats use successful probes only — a failed probe's latency is just
+    the time-to-failure and would skew the numbers."""
+    rows = store.history(name, hours=hours) if store else []
+    if not rows:
+        return {"samples": 0, "uptime_pct": None, "avg_ms": None, "min_ms": None,
+                "max_ms": None, "p95_ms": None, "jitter_ms": None}
+    ups = sum(1 for r in rows if r["status"] == "up")
+    lat = [r["latency_ms"] for r in rows
+           if r["status"] == "up" and r["latency_ms"] is not None]
+    jitter = None
+    if len(lat) >= 2:
+        diffs = [abs(lat[i] - lat[i - 1]) for i in range(1, len(lat))]
+        jitter = round(sum(diffs) / len(diffs), 1)
+    return {
+        "samples": len(rows),
+        "uptime_pct": round(100 * ups / len(rows), 1),
+        "avg_ms": round(sum(lat) / len(lat)) if lat else None,
+        "min_ms": min(lat) if lat else None,
+        "max_ms": max(lat) if lat else None,
+        "p95_ms": round(_percentile(lat, 95)) if lat else None,
+        "jitter_ms": jitter,
+    }
+
+
+def internet_snapshot(state, store, int_cfg, hours=1):
+    """Live status (from the in-memory ring) + QoS aggregates (from SQLite) for
+    every probe in the configured internet group — the Global URL trackers."""
+    group = int_cfg.get("group", "internet")
+    urls = []
+    up = down = degraded = 0
+    avg_acc = []
+    for t in state.snapshot()["targets"]:
+        if t.get("group") != group:
+            continue
+        qos = _qos_stats(store, t["name"], hours)
+        urls.append({
+            "name": t["name"], "label": t["label"], "group": t["group"],
+            "status": t["status"], "latency_ms": t["latency_ms"],
+            "uptime": t["uptime"], "since": t["since"],
+            "last_checked": t["last_checked"], "detail": t["detail"],
+            "spark": t["spark"], "qos": qos,
+        })
+        if t["status"] == "down":
+            down += 1
+        elif t["status"] == "degraded":
+            degraded += 1
+        else:
+            up += 1
+        if qos.get("avg_ms") is not None:
+            avg_acc.append(qos["avg_ms"])
+    urls.sort(key=lambda u: u["name"])
+    return {
+        "ok": True,
+        "generated": datetime.now(timezone.utc).isoformat(),
+        "group": group,
+        "hours": hours,
+        "thresholds": {"poor_ms": int_cfg.get("poor_ms", 400),
+                       "degrade_ms": int_cfg.get("degrade_ms", 800)},
+        "summary": {
+            "total": len(urls), "up": up, "down": down, "degraded": degraded,
+            "avg_ms": round(sum(avg_acc) / len(avg_acc)) if avg_acc else None,
+        },
+        "urls": urls,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -428,6 +523,12 @@ def monitor_loop(cfg, state, store=None, host_latest=None,
     hm = cfg["host_metrics"]
     es = cfg["elastic"]
     kf = cfg["kafka"]
+    it = cfg["internet"]
+    internet_group = it.get("group", "internet")
+    internet_degrade_ms = int(it.get("degrade_ms", 800))
+    internet_names = {t["name"] for t in cfg["targets"]
+                      if t.get("group") == internet_group and t["type"] == "http"}
+    internet_degraded = False  # last posted panel state (alert on transitions only)
     mongo_t = next((t for t in cfg["targets"]
                     if t["type"] == "tcp" and "mongo" in t["name"].lower()), None)
     mongo_prev = None      # previous perf_sample for delta-based latency
@@ -457,6 +558,29 @@ def monitor_loop(cfg, state, store=None, host_latest=None,
                     store.insert_event(name, "transition", f"{new}: {detail}")
         if store and cycle_rows:
             store.insert_samples(cycle_rows)
+
+        # Internet QoS: a reachable-but-slow URL degrades the panel (amber on the
+        # dashboard + drill-down). One panel-level Mattermost transition, not per
+        # URL, so a flapping endpoint can't spam the channel.
+        if it["enable"] and internet_names:
+            slow = []
+            for nm, new, latency in cycle_rows:
+                if nm not in internet_names:
+                    continue
+                deg = new == "up" and latency is not None and latency > internet_degrade_ms
+                state.set_degraded(
+                    nm, deg,
+                    f"latency {latency}ms (>{internet_degrade_ms}ms)" if deg else "")
+                if deg:
+                    slow.append(f"{nm} {latency}ms")
+            if bool(slow) != internet_degraded:
+                internet_degraded = bool(slow)
+                post_perf(mm, "Internet QoS", internet_degraded, slow)
+                if store:
+                    store.insert_event(
+                        "internet", "perf",
+                        ("degraded: " + "; ".join(slow)) if internet_degraded
+                        else "recovered")
 
         if mp["enable"] and mongo_t is not None:
             cur = mongo.perf_sample(mongo_t["host"], int(mongo_t["port"]),
@@ -609,6 +733,7 @@ def make_handler(state, cfg, store=None, host_latest=None, ollama_latest=None,
     ol_cfg = cfg["ollama"]
     es_cfg = cfg["elastic"]
     kf_cfg = cfg["kafka"]
+    int_cfg = cfg["internet"]
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *args):  # silence per-request logging
@@ -698,6 +823,28 @@ def make_handler(state, cfg, store=None, host_latest=None, ollama_latest=None,
                     hours = float(q.get("hours", ["6"])[0])
                     self._send(200, json.dumps(
                         store.kafka_history(hours=hours)).encode())
+            elif path == "/api/internet":
+                if not int_cfg.get("enable"):
+                    self._send(404, b'{"ok":false,"error":"internet qos not configured"}')
+                else:
+                    q = self._query()
+                    hours = float(q.get("hours", ["1"])[0])
+                    self._send(200, json.dumps(
+                        internet_snapshot(state, store, int_cfg, hours=hours)).encode())
+            elif path == "/api/internet/history":
+                # Merged per-URL latency/status trend for the QoS chart — one call
+                # returns every tracked URL's series (reusing the samples table).
+                if store is None:
+                    self._send(200, b'{"names":[],"series":{}}')
+                else:
+                    q = self._query()
+                    hours = float(q.get("hours", ["6"])[0])
+                    group = int_cfg.get("group", "internet")
+                    names = [t["name"] for t in cfg["targets"]
+                             if t.get("group") == group and t["type"] == "http"]
+                    series = {n: store.history(n, hours=hours) for n in names}
+                    self._send(200, json.dumps(
+                        {"names": names, "series": series}).encode())
             elif path == "/api/mongo/history":
                 if store is None:
                     self._send(200, b"[]")
@@ -772,7 +919,8 @@ def main():
           f"interval={cfg['interval']}s, mattermost={cfg['mattermost']['enable']}, "
           f"host_metrics={cfg['host_metrics']['enable']}, "
           f"ollama={cfg['ollama']['enable']}, elastic={cfg['elastic']['enable']}, "
-          f"kafka={cfg['kafka']['enable']}", flush=True)
+          f"kafka={cfg['kafka']['enable']}, internet={cfg['internet']['enable']}",
+          flush=True)
     ThreadingHTTPServer(("0.0.0.0", port),
                         make_handler(state, cfg, store, host_latest,
                                      ollama_latest, elastic_latest,

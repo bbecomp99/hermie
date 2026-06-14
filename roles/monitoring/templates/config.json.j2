@@ -46,5 +46,11 @@
     "client_id": {{ monitor_kafka_client_id | to_json }},
     "min_brokers": {{ monitor_kafka_min_brokers }}
   },
+  "internet": {
+    "enable": {{ monitor_internet_enable | bool | to_json }},
+    "group": {{ monitor_internet_group | to_json }},
+    "poor_ms": {{ monitor_internet_poor_ms }},
+    "degrade_ms": {{ monitor_internet_degrade_ms }}
+  },
   "targets": {{ monitor_targets | to_nice_json(indent=4) | indent(2) }}
 }

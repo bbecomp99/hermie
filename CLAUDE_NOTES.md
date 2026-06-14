@@ -3,6 +3,46 @@
 Running notes for the `hermie` repo so I can catch myself up across sessions.
 Newest context at the top of each section. **No secrets in this file.**
 
+## 2026-06-14 — Argus: Internet QoS drill-down (merged URL trackers) — DEPLOYED
+- **Deployed to .128 + verified live** (`ansible-playbook playbook.yml --tags
+  monitoring --become-password-file <pw>`; vault.yml is plaintext-gitignored so no
+  vault pass; become pw lives in repo `.env` as `PASS`). Image rebuilt via the
+  Rebuild/Restart handlers, `failed=0`. `/api/internet` → `ok:true`, both URLs up:
+  api.massive.com 184ms (avg 184/p95 229/jitter 26.6/100%), google.com 372ms (avg
+  310/p95 402/jitter 55.7/100%), summary avg 247ms; `internet.html` serves 200;
+  history already had ~120 samples/URL (they were probed pre-existing since 6-12).
+- New drill-down **`internet.html`** (🌐 sky/azure accent) — a "Global URL
+  trackers" / quality-of-service panel that **merges the two internet-group
+  probes** (`google.com`, `api.massive.com`) into one view. On the dashboard the
+  two separate cards now collapse into a single **"Internet QoS"** card
+  (`renderInternetCard()` in `index.html`) that drills into the page; the other
+  cards still render 1:1 via the refactored `renderCard()`.
+- **No new sampling, no new table.** The internet probes already write
+  `status`+`latency_ms` to the `samples` table every cycle, so QoS is computed
+  straight from `store.history()`. New backend in `app.py`:
+  - `_qos_stats()` — per-URL uptime %, avg/min/max latency, **p95** (linear-interp
+    `_percentile()`), and **jitter** (mean abs delta between consecutive
+    latencies). Latency stats use successful probes only.
+  - `internet_snapshot()` — live status (in-memory ring) + QoS aggregates over
+    the last hour for every probe in `internet.group`.
+  - Endpoints: `/api/internet` (live + QoS, `?hours=` window) and
+    `/api/internet/history?hours=` (merged `{names, series}` — one call returns
+    every URL's latency/status trend for the multi-line chart).
+  - Loop: a reachable-but-slow URL (latency > `degrade_ms`) marks the panel
+    **degraded** (amber, via `state.set_degraded`) and posts **one panel-level**
+    Mattermost degraded↔recovered transition (not per-URL, so a flapping
+    endpoint can't spam) — reuses `post_perf`.
+- **Config** (`monitor_internet_*` in `defaults/main.yml` → `config.json.j2`):
+  `enable` (default true), `group` ("internet"), `poor_ms` (400, amber on page),
+  `degrade_ms` (800, panel degrades). Add more tracked URLs by appending probes
+  with `group: "internet"`. No Dockerfile/compose change (static dir is COPYed
+  wholesale; no new .py / env).
+- **Smoke-tested locally**: app boots, both pages serve 200, endpoints return
+  correct shape, QoS math verified against injected samples (uptime 10/16=62.5%,
+  avg 136, p95 522, jitter 196.4). Sandbox has no outbound net so live probes
+  read "down" here — real up/down + latency only show once deployed on .128.
+- ⚠️ **Not yet deployed** (same `--tags monitoring`, needs pinky sudo).
+
 ## 2026-06-13 — Argus: Elasticsearch + Kafka drill-down pages
 - Added two full detail pages (drill-in from the index cards, like Mongo/Ollama):
   **`elastic.html`** (teal accent, 🔎) and **`kafka.html`** (copper accent, "K"
