@@ -76,6 +76,12 @@ monitor_kafka_host: "{{ monitor_host_127 }}"
 monitor_kafka_port: 9092
 monitor_kafka_client_id: "argus"
 monitor_kafka_min_brokers: 1                       # degrade if fewer brokers than this are up
+# Traffic + queue-depth view: ListOffsets gives per-partition log-end offsets
+# (Σ delta/sec = message throughput); ListGroups + OffsetFetch give consumer-group
+# committed offsets (end - committed = lag, i.e. queues building up).
+monitor_kafka_track_traffic: true                  # show message throughput (msgs/sec)
+monitor_kafka_track_lag: true                      # show consumer-group lag (queue depth)
+monitor_kafka_lag_degrade: 0                        # total lag above this degrades; 0 = display only
 
 # Internet QoS — "Global URL trackers". The internet-group HTTP probes in
 # monitor_targets below double as a quality-of-service panel: their per-cycle

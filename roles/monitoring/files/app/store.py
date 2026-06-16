@@ -47,10 +47,18 @@ CREATE INDEX IF NOT EXISTS idx_elastic_ts ON elastic_perf(ts);
 
 CREATE TABLE IF NOT EXISTS kafka_perf (
     ts INTEGER NOT NULL, brokers INTEGER, topics INTEGER, partitions INTEGER,
-    under_replicated INTEGER, offline INTEGER
+    under_replicated INTEGER, offline INTEGER,
+    msgs_per_sec REAL, total_lag INTEGER, consumer_groups INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_kafka_ts ON kafka_perf(ts);
 """
+
+# Columns added after the table first shipped — applied idempotently at startup
+# so existing DBs (e.g. the live .128 one) pick them up via ALTER TABLE.
+_MIGRATIONS = {
+    "kafka_perf": [("msgs_per_sec", "REAL"), ("total_lag", "INTEGER"),
+                   ("consumer_groups", "INTEGER")],
+}
 
 
 class Store:
@@ -63,7 +71,17 @@ class Store:
         self._db.execute("PRAGMA journal_mode=WAL")
         self._db.execute("PRAGMA synchronous=NORMAL")
         self._db.executescript(SCHEMA)
+        self._migrate()
         self._db.commit()
+
+    def _migrate(self):
+        """Add columns introduced after a table first shipped (idempotent)."""
+        for table, cols in _MIGRATIONS.items():
+            have = {r[1] for r in self._db.execute(f"PRAGMA table_info({table})")}
+            for name, decl in cols:
+                if name not in have:
+                    self._db.execute(
+                        f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
 
     # ---- writes -----------------------------------------------------------
     def insert_samples(self, rows):
@@ -119,9 +137,12 @@ class Store:
         with self._lock:
             self._db.execute(
                 "INSERT INTO kafka_perf(ts,brokers,topics,partitions,"
-                "under_replicated,offline) VALUES(?,?,?,?,?,?)",
+                "under_replicated,offline,msgs_per_sec,total_lag,consumer_groups) "
+                "VALUES(?,?,?,?,?,?,?,?,?)",
                 (int(time.time()), m.get("brokers"), m.get("topics"),
-                 m.get("partitions"), m.get("under_replicated"), m.get("offline")))
+                 m.get("partitions"), m.get("under_replicated"), m.get("offline"),
+                 m.get("msgs_per_sec"), m.get("total_lag"),
+                 m.get("consumer_groups")))
             self._db.commit()
 
     def insert_event(self, target, kind, detail):
@@ -177,10 +198,12 @@ class Store:
     def kafka_history(self, hours=6, limit=1000):
         since = int(time.time()) - int(hours * 3600)
         rows = self._range(
-            "SELECT ts,brokers,topics,partitions,under_replicated,offline "
+            "SELECT ts,brokers,topics,partitions,under_replicated,offline,"
+            "msgs_per_sec,total_lag,consumer_groups "
             "FROM kafka_perf WHERE ts>=? ORDER BY ts", (since,), limit)
         return [{"ts": r[0], "brokers": r[1], "topics": r[2], "partitions": r[3],
-                 "under_replicated": r[4], "offline": r[5]} for r in rows]
+                 "under_replicated": r[4], "offline": r[5], "msgs_per_sec": r[6],
+                 "total_lag": r[7], "consumer_groups": r[8]} for r in rows]
 
     def history(self, target, hours=24, limit=2000):
         since = int(time.time()) - int(hours * 3600)

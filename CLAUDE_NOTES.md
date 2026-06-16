@@ -3,6 +3,53 @@
 Running notes for the `hermie` repo so I can catch myself up across sessions.
 Newest context at the top of each section. **No secrets in this file.**
 
+## 2026-06-15 — Argus: Kafka traffic + consumer-lag (queue depth) on the drill-down
+- The Kafka page only read **metadata** (brokers/ISR). Added two things the user
+  asked for: **message throughput** and **queues building up** (consumer lag).
+- **`kafka.py`** — three new pre-flexible wire requests (same hand-rolled style,
+  trivial length-prefixed parsing):
+  - **ListOffsets v1** (key 2, timestamp -1) → per-partition **log-end offset**
+    (high-watermark). Σ = cumulative messages; the loop takes a **delta/sec** →
+    msgs/sec throughput. `_list_offsets()`.
+  - **ListGroups v0** (key 16) + **OffsetFetch v2** (key 9, null topics = all) →
+    consumer-group committed offsets. **lag = end − committed**, summed per group
+    → queue depth. `_list_groups()` / `_offset_fetch()`.
+  - All sent on the **bootstrap connection** (single-broker LAN assumption). On a
+    multi-broker cluster, partitions/groups the bootstrap doesn't own answer
+    NOT_LEADER / NOT_COORDINATOR → skipped (partial counts), never fatal. Each
+    request is wrapped in try/except so traffic/lag are best-effort and can't
+    break the core metadata health.
+  - `health(..., track_traffic, track_lag)` now also returns `traffic`
+    {total_end_offset (user topics), total_end_offset_all, topics[top 25]} and
+    `consumers` {total_lag, group_count, groups[{group_id, protocol_type, lag,
+    partitions, topics, active}]}. `summary` gains total_lag + consumer_groups.
+    `perf_sample()` carries `total_end_offset` so the loop can delta it.
+- **`app.py`** — `eval_kafka_perf(prev, cur, thr, dt)` (was instantaneous) now
+  computes `msgs_per_sec` from the end-offset delta (mirrors the ES QPS pattern;
+  counter reset → None) and adds a **lag degrade rule** (total lag > `lag_degrade`,
+  default 0 = display-only). Loop tracks `kafka_prev`, stores **metrics** (not the
+  raw sample) into `kafka_latest`, and `/api/kafka` injects it as `data.rates`
+  (live msgs/sec), exactly like `/api/elastic`.
+- **`store.py`** — `kafka_perf` gains `msgs_per_sec / total_lag / consumer_groups`
+  + a new **idempotent `_migrate()`** (`ALTER TABLE ADD COLUMN` if missing, via
+  `_MIGRATIONS`) so the **live .128 DB** (already has the old table) picks them up
+  on restart. `kafka_history()` returns the new columns for the charts.
+- **`kafka.html`** — new **"Traffic & queues"** section: Throughput (msgs/sec),
+  Consumer lag, Busiest topic, Consumer-groups heroes; two auto-scaled trend
+  charts (throughput emerald / lag amber) sharing the existing range selector via
+  a generic `drawMetricChart()`; and a **consumer-groups table** (group · state ·
+  topics · partitions · lag, highest lag first, amber-tinted rows when lag>0).
+  Sections hide when their track flag is off.
+- **Config**: `monitor_kafka_track_traffic` / `_track_lag` (default true) +
+  `monitor_kafka_lag_degrade` (default 0) in `defaults/main.yml` → `config.json.j2`.
+- ✅ **Validated against the LIVE broker** — the sandbox could reach Kafka this
+  time (127.0.0.1:9092 → advertised .127). Real data: topics `stonks.ticks.v1`
+  (6 part, **42.95M msgs**), `stonks.agentic.v1`, `__consumer_offsets`; groups
+  `stonks-distributor` / `agentic-distributor` both **lag 0** (caught up).
+  Wire round-trips, store migration (old→new schema), eval delta, and a 2-sample
+  throughput delta all unit/smoke-tested green; full server boots, page 200,
+  endpoints correct. ⚠️ Not yet deployed — same `--tags monitoring` (pinky sudo).
+
 ## 2026-06-14 — Argus: Internet QoS drill-down (merged URL trackers) — DEPLOYED
 - **Deployed to .128 + verified live** (`ansible-playbook playbook.yml --tags
   monitoring --become-password-file <pw>`; vault.yml is plaintext-gitignored so no

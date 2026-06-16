@@ -106,8 +106,8 @@
 
     <script>
         const REFRESH_MS = 5000;
-        let trendRange = 6;        // hours shown in the partition-health chart
-        let trendData = [];        // [{ts, under_replicated, offline, partitions, brokers}]
+        let trendRange = 6;        // hours shown in the trend charts
+        let trendData = [];        // [{ts, under_replicated, offline, msgs_per_sec, total_lag, consumer_groups, ...}]
         const RANGES = [{ h: 1, l: '1H' }, { h: 6, l: '6H' }, { h: 24, l: '1D' }, { h: 168, l: '1W' }];
 
         const num = (n) => (n === null || n === undefined) ? '—' : new Intl.NumberFormat('en-US').format(n);
@@ -132,7 +132,12 @@
         async function loadTrend() {
             try { const r = await fetch('/api/kafka/history?hours=' + trendRange); trendData = await r.json(); }
             catch (e) { trendData = []; }
+            drawCharts();
+        }
+        function drawCharts() {
             drawTrend();
+            drawMetricChart('trafficChart', 'trafficAxis', 'msgs_per_sec', '#34d399');
+            drawMetricChart('lagChart', 'lagAxis', 'total_lag', '#f59e0b');
         }
         function setRange(h) { trendRange = h; loadTrend(); }
         window.setRange = setRange;
@@ -181,6 +186,28 @@
                 ${opts ? `<polyline fill="none" stroke="#ef4444" stroke-width="1.5" vector-effect="non-scaling-stroke" points="${opts}"/>` : ''}
             </svg>`;
             if (axisEl) axisEl.innerHTML = `<span>${fmtTs(trendData[0].ts)}</span><span>0–${max} · ${trendData.length} pts</span><span>${fmtTs(trendData[trendData.length - 1].ts)}</span>`;
+        }
+
+        // generic single-metric line chart (auto-scaled to its own peak)
+        function drawMetricChart(elId, axisId, key, color) {
+            const el = document.getElementById(elId);
+            if (!el) return;
+            const axisEl = document.getElementById(axisId);
+            const vals = trendData.map(d => d[key]).filter(v => v != null);
+            if (vals.length < 2) {
+                el.innerHTML = '<div class="h-32 flex items-center justify-center text-slate-600 text-sm">no samples in this range yet…</div>';
+                if (axisEl) axisEl.innerHTML = '';
+                return;
+            }
+            const max = Math.max(...vals, 1);
+            const W = 600, H = 130;
+            const pts = _line(key, max, W, H);
+            el.innerHTML = `<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" class="w-full h-32">
+                <line x1="0" y1="2" x2="${W}" y2="2" stroke="#334155" stroke-width="0.5" vector-effect="non-scaling-stroke"/>
+                <line x1="0" y1="${H/2}" x2="${W}" y2="${H/2}" stroke="#1e293b" stroke-width="0.5" vector-effect="non-scaling-stroke"/>
+                ${pts ? `<polyline fill="none" stroke="${color}" stroke-width="1.5" vector-effect="non-scaling-stroke" points="${pts}"/>` : ''}
+            </svg>`;
+            if (axisEl) axisEl.innerHTML = `<span>${fmtTs(trendData[0].ts)}</span><span>peak ${num(max)} · ${trendData.length} pts</span><span>${fmtTs(trendData[trendData.length - 1].ts)}</span>`;
         }
 
         function showSkeletons() {
@@ -252,6 +279,59 @@
                 <p class="text-xs text-slate-500 mt-1 ml-5">Derived from broker metadata: under-replicated = partitions whose in-sync replica set is smaller than the assigned replica set; offline = partitions with no elected leader. Both should sit at zero.</p></div>
                 <div class="mt-4">${heroes}${trend}</div>`;
 
+            // ---- Traffic & queues (throughput + consumer lag) ----
+            const tr = d.traffic || {}, co = d.consumers || {};
+            const mps = (d.rates && d.rates.msgs_per_sec != null) ? d.rates.msgs_per_sec : null;
+            const totalLag = co.total_lag;
+            const topTopic = (tr.topics || []).find(t => !t.internal) || (tr.topics || [])[0];
+            const lagColor = (v) => (v == null) ? 'text-slate-400' : (v > 0 ? 'text-amber-400' : 'text-emerald-400');
+            const lagBorder = (v) => (v == null) ? 'border-slate-600' : (v > 0 ? 'border-amber-500' : 'border-emerald-500');
+
+            const trafficHeroes = `<div class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-6">
+                ${stat('Throughput', mps == null ? '—' : num(mps), 'text-emerald-400', 'border-emerald-500', 'messages / sec (Σ partitions)')}
+                ${stat('Consumer lag', num(totalLag), lagColor(totalLag), lagBorder(totalLag), `${num(co.group_count)} group(s) · end − committed`)}
+                ${stat('Busiest topic', topTopic ? topTopic.name : '—', 'text-white', 'border-sky-500', topTopic ? num(topTopic.end_offset) + ' messages' : 'no traffic seen')}
+                ${stat('Consumer groups', num(co.group_count), 'text-white', 'border-amber-500', 'committing offsets')}
+            </div>`;
+
+            const trafficChart = `<div class="grid grid-cols-1 lg:grid-cols-2 gap-4 mb-8">
+                <div class="glass p-5 rounded-xl border-t-4 border-emerald-500 shadow-md">
+                    <h3 class="text-xs uppercase tracking-wider font-bold text-slate-400 mb-3 flex items-center gap-2"><span class="inline-block w-3 h-[2px]" style="background:#34d399"></span>Message throughput · msgs/sec</h3>
+                    <div id="trafficChart"></div>
+                    <div class="flex justify-between text-[10px] text-slate-500 mt-1" id="trafficAxis"></div>
+                </div>
+                <div class="glass p-5 rounded-xl border-t-4 border-amber-500 shadow-md">
+                    <h3 class="text-xs uppercase tracking-wider font-bold text-slate-400 mb-3 flex items-center gap-2"><span class="inline-block w-3 h-[2px]" style="background:#f59e0b"></span>Consumer lag · total queue depth</h3>
+                    <div id="lagChart"></div>
+                    <div class="flex justify-between text-[10px] text-slate-500 mt-1" id="lagAxis"></div>
+                </div>
+            </div>`;
+
+            // ---- consumer groups table (highest lag first) ----
+            const groupRows = (co.groups || []).map(g => `
+                <tr class="border-b border-slate-800/50 hover:bg-slate-800/60 transition-colors ${g.lag > 0 ? 'bg-amber-500/5' : ''}">
+                    <td class="py-3 px-4 font-semibold text-white">${g.group_id || '<span class="text-slate-500">(empty id)</span>'}</td>
+                    <td class="py-3 px-4">${g.active ? '<span class="pill">' + (g.protocol_type || 'active') + '</span>' : '<span class="pill pill-int">empty</span>'}</td>
+                    <td class="py-3 px-4 text-right text-slate-300">${num(g.topics)}</td>
+                    <td class="py-3 px-4 text-right text-slate-300">${num(g.partitions)}</td>
+                    <td class="py-3 px-4 text-right font-bold ${lagColor(g.lag)}">${num(g.lag)}</td>
+                </tr>`).join('') || `<tr><td colspan="5" class="text-center py-8 text-slate-500">No consumer groups committing offsets.</td></tr>`;
+            const groupTable = (co.tracked === false) ? '' : `<div class="mb-2"><h2 class="text-xl font-bold text-white flex items-center"><span class="w-2 h-6 bg-amber-500 rounded-full mr-3"></span>Consumer groups</h2>
+                <p class="text-xs text-slate-500 mt-1 ml-5">Lag = log-end offset − committed offset, summed across the group's partitions. Growing lag means consumers are falling behind producers (a queue building up). Highest lag first.</p></div>
+                <div class="glass rounded-xl shadow-xl overflow-x-auto mt-4 mb-8">
+                    <table class="w-full text-left border-collapse text-sm">
+                        <thead class="bg-slate-900"><tr class="text-xs uppercase tracking-wide text-slate-500 border-b border-slate-700">
+                            <th class="py-4 px-4">Group</th><th class="py-4 px-4">State</th><th class="py-4 px-4 text-right">Topics</th>
+                            <th class="py-4 px-4 text-right">Partitions</th><th class="py-4 px-4 text-right">Lag</th>
+                        </tr></thead><tbody>${groupRows}</tbody>
+                    </table>
+                </div>`;
+
+            const trafficSection = (tr.tracked === false && co.tracked === false) ? '' :
+                `<div class="mb-2"><h2 class="text-xl font-bold text-white flex items-center"><span class="w-2 h-6 bg-emerald-500 rounded-full mr-3"></span>Traffic &amp; queues</h2>
+                <p class="text-xs text-slate-500 mt-1 ml-5">Throughput from the per-partition log-end offset (cumulative messages); lag from each consumer group's committed offset. Watch for throughput dropping to zero or lag climbing.</p></div>
+                <div class="mt-4">${trafficHeroes}${trafficChart}</div>`;
+
             // ---- brokers table ----
             const brokerRows = (d.brokers||[]).map(b => `
                 <tr class="border-b border-slate-800/50 hover:bg-slate-800/60 transition-colors">
@@ -293,8 +373,9 @@
                     </table>
                 </div>`;
 
-            document.getElementById('content').innerHTML = stats + perfSection + brokerTable + topicTable;
-            drawTrend();
+            document.getElementById('content').innerHTML =
+                stats + perfSection + trafficSection + groupTable + brokerTable + topicTable;
+            drawCharts();
         }
 
         async function load() {

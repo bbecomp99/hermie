@@ -44,7 +44,10 @@
     "host": {{ monitor_kafka_host | to_json }},
     "port": {{ monitor_kafka_port }},
     "client_id": {{ monitor_kafka_client_id | to_json }},
-    "min_brokers": {{ monitor_kafka_min_brokers }}
+    "min_brokers": {{ monitor_kafka_min_brokers }},
+    "track_traffic": {{ monitor_kafka_track_traffic | bool | to_json }},
+    "track_lag": {{ monitor_kafka_track_lag | bool | to_json }},
+    "lag_degrade": {{ monitor_kafka_lag_degrade }}
   },
   "internet": {
     "enable": {{ monitor_internet_enable | bool | to_json }},

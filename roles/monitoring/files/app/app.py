@@ -88,6 +88,9 @@ def load_config():
     kf.setdefault("port", 9092)
     kf.setdefault("client_id", "argus")
     kf.setdefault("min_brokers", 1)        # degrade if fewer brokers than this are up
+    kf.setdefault("track_traffic", True)   # pull log-end offsets → throughput
+    kf.setdefault("track_lag", True)        # pull consumer-group committed offsets → lag
+    kf.setdefault("lag_degrade", 0)        # total lag above this degrades (0 = display only)
     it = cfg.setdefault("internet", {})
     it.setdefault("enable", False)
     it.setdefault("group", "internet")     # probe group that feeds the QoS panel
@@ -482,12 +485,20 @@ def eval_elastic_perf(prev, cur, thr, dt):
     return bool(reasons), reasons, m
 
 
-def eval_kafka_perf(cur, thr):
-    """Derive (degraded, reasons, metrics) from a kafka.perf_sample(). All signals
-    are instantaneous (no deltas): offline / under-replicated partitions, a missing
-    controller, or a shrunken broker count."""
+def eval_kafka_perf(prev, cur, thr, dt):
+    """Derive (degraded, reasons, metrics) from two kafka.perf_sample()s. Cluster
+    signals are instantaneous (offline / under-replicated partitions, a missing
+    controller, a shrunken broker count); throughput (msgs/sec) comes from the
+    log-end-offset delta, and consumer lag degrades only above lag_degrade (>0)."""
     m = {k: cur.get(k) for k in
          ("brokers", "topics", "partitions", "under_replicated", "offline")}
+    m["total_lag"] = cur.get("total_lag")
+    m["consumer_groups"] = cur.get("consumer_groups")
+    m["msgs_per_sec"] = None
+    if prev and dt > 0:
+        de = (cur.get("total_end_offset") or 0) - (prev.get("total_end_offset") or 0)
+        m["msgs_per_sec"] = round(de / dt, 2) if de >= 0 else None  # counter reset → skip
+
     reasons = []
     if (cur.get("offline") or 0) > 0:
         reasons.append(f"{cur['offline']} offline partition(s)")
@@ -497,6 +508,9 @@ def eval_kafka_perf(cur, thr):
         reasons.append("no active controller")
     if cur.get("brokers") is not None and cur["brokers"] < thr["min_brokers"]:
         reasons.append(f"only {cur['brokers']} broker(s) (<{thr['min_brokers']})")
+    lag_deg = thr.get("lag_degrade", 0)
+    if lag_deg and (cur.get("total_lag") or 0) > lag_deg:
+        reasons.append(f"consumer lag {cur['total_lag']:,} (>{lag_deg:,})")
     return bool(reasons), reasons, m
 
 
@@ -535,6 +549,7 @@ def monitor_loop(cfg, state, store=None, host_latest=None,
     mongo_degraded = False  # last posted state (alert only on transitions)
     es_prev = None         # previous ES perf_sample for delta-based QPS
     es_degraded = False
+    kafka_prev = None      # previous Kafka perf_sample for delta-based throughput
     kafka_degraded = False
     # Count the heartbeat clock from startup, so the first one lands a full
     # interval in (no spam on every redeploy/restart).
@@ -629,18 +644,23 @@ def monitor_loop(cfg, state, store=None, host_latest=None,
                 es_prev = cur
 
         if kf["enable"] and kf["host"]:
-            cur = kafka.perf_sample(kf["host"], int(kf["port"]),
-                                    kf.get("client_id", "argus"), timeout=5)
+            cur = kafka.perf_sample(
+                kf["host"], int(kf["port"]), kf.get("client_id", "argus"),
+                timeout=5, track_traffic=kf.get("track_traffic", True),
+                track_lag=kf.get("track_lag", True))
             if cur:
-                degraded, reasons, metrics = eval_kafka_perf(cur, kf)
+                degraded, reasons, metrics = eval_kafka_perf(
+                    kafka_prev, cur, kf, dt=interval)
                 state.set_degraded("kafka", degraded, "; ".join(reasons))
                 if kafka_latest is not None:
                     kafka_latest.clear()
-                    kafka_latest.update(cur)
+                    kafka_latest.update(metrics)
                 print(f"[argus] kafka brokers={cur.get('brokers')} "
                       f"partitions={cur.get('partitions')} "
                       f"under_repl={cur.get('under_replicated')} "
-                      f"offline={cur.get('offline')}"
+                      f"offline={cur.get('offline')} "
+                      f"lag={cur.get('total_lag')} "
+                      f"msg/s={metrics.get('msgs_per_sec')}"
                       f"{' DEGRADED' if degraded else ''}", flush=True)
                 if store:
                     store.insert_kafka_perf(metrics)
@@ -652,6 +672,7 @@ def monitor_loop(cfg, state, store=None, host_latest=None,
                             "kafka", "perf",
                             ("degraded: " + "; ".join(reasons)) if degraded
                             else "recovered")
+                kafka_prev = cur
 
         if hm["enable"] and hm["ssh_host"]:
             hs = hoststat.sample(hm["ssh_user"], hm["ssh_host"],
@@ -812,8 +833,13 @@ def make_handler(state, cfg, store=None, host_latest=None, ollama_latest=None,
                 if not kf_cfg.get("enable") or not kf_cfg.get("host"):
                     self._send(404, b'{"ok":false,"error":"kafka not configured"}')
                 else:
-                    data = kafka.health(kf_cfg["host"], int(kf_cfg["port"]),
-                                        kf_cfg.get("client_id", "argus"), timeout=5)
+                    data = kafka.health(
+                        kf_cfg["host"], int(kf_cfg["port"]),
+                        kf_cfg.get("client_id", "argus"), timeout=5,
+                        track_traffic=kf_cfg.get("track_traffic", True),
+                        track_lag=kf_cfg.get("track_lag", True))
+                    if kafka_latest:
+                        data["rates"] = dict(kafka_latest)  # loop-computed msgs/sec
                     self._send(200, json.dumps(data).encode())
             elif path == "/api/kafka/history":
                 if store is None:
