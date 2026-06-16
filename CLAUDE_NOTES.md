@@ -3,6 +3,146 @@
 Running notes for the `hermie` repo so I can catch myself up across sessions.
 Newest context at the top of each section. **No secrets in this file.**
 
+## 2026-06-15 — Argus: Kafka traffic + consumer-lag (queue depth) on the drill-down — DEPLOYED
+- The Kafka page only read **metadata** (brokers/ISR). Added two things the user
+  asked for: **message throughput** and **queues building up** (consumer lag).
+- **`kafka.py`** — three new pre-flexible wire requests (same hand-rolled style,
+  trivial length-prefixed parsing):
+  - **ListOffsets v1** (key 2, timestamp -1) → per-partition **log-end offset**
+    (high-watermark). Σ = cumulative messages; the loop takes a **delta/sec** →
+    msgs/sec throughput. `_list_offsets()`.
+  - **ListGroups v0** (key 16) + **OffsetFetch v2** (key 9, null topics = all) →
+    consumer-group committed offsets. **lag = end − committed**, summed per group
+    → queue depth. `_list_groups()` / `_offset_fetch()`.
+  - All sent on the **bootstrap connection** (single-broker LAN assumption). On a
+    multi-broker cluster, partitions/groups the bootstrap doesn't own answer
+    NOT_LEADER / NOT_COORDINATOR → skipped (partial counts), never fatal. Each
+    request is wrapped in try/except so traffic/lag are best-effort and can't
+    break the core metadata health.
+  - `health(..., track_traffic, track_lag)` now also returns `traffic`
+    {total_end_offset (user topics), total_end_offset_all, topics[top 25]} and
+    `consumers` {total_lag, group_count, groups[{group_id, protocol_type, lag,
+    partitions, topics, active}]}. `summary` gains total_lag + consumer_groups.
+    `perf_sample()` carries `total_end_offset` so the loop can delta it.
+- **`app.py`** — `eval_kafka_perf(prev, cur, thr, dt)` (was instantaneous) now
+  computes `msgs_per_sec` from the end-offset delta (mirrors the ES QPS pattern;
+  counter reset → None) and adds a **lag degrade rule** (total lag > `lag_degrade`,
+  default 0 = display-only). Loop tracks `kafka_prev`, stores **metrics** (not the
+  raw sample) into `kafka_latest`, and `/api/kafka` injects it as `data.rates`
+  (live msgs/sec), exactly like `/api/elastic`.
+- **`store.py`** — `kafka_perf` gains `msgs_per_sec / total_lag / consumer_groups`
+  + a new **idempotent `_migrate()`** (`ALTER TABLE ADD COLUMN` if missing, via
+  `_MIGRATIONS`) so the **live .128 DB** (already has the old table) picks them up
+  on restart. `kafka_history()` returns the new columns for the charts.
+- **`kafka.html`** — new **"Traffic & queues"** section: Throughput (msgs/sec),
+  Consumer lag, Busiest topic, Consumer-groups heroes; two auto-scaled trend
+  charts (throughput emerald / lag amber) sharing the existing range selector via
+  a generic `drawMetricChart()`; and a **consumer-groups table** (group · state ·
+  topics · partitions · lag, highest lag first, amber-tinted rows when lag>0).
+  Sections hide when their track flag is off.
+- **Config**: `monitor_kafka_track_traffic` / `_track_lag` (default true) +
+  `monitor_kafka_lag_degrade` (default 0) in `defaults/main.yml` → `config.json.j2`.
+- ✅ **Validated against the LIVE broker** — the sandbox could reach Kafka this
+  time (127.0.0.1:9092 → advertised .127). Real data: topics `stonks.ticks.v1`
+  (6 part, **42.95M msgs**), `stonks.agentic.v1`, `__consumer_offsets`; groups
+  `stonks-distributor` / `agentic-distributor` both **lag 0** (caught up).
+  Wire round-trips, store migration (old→new schema), eval delta, and a 2-sample
+  throughput delta all unit/smoke-tested green; full server boots, page 200,
+  endpoints correct.
+- ✅ **DEPLOYED to .128 + verified live** (`--tags monitoring --become-password-file`,
+  pw from `.env` PASS, colon-delimited so extract the value after `PASS:` into a
+  600 temp file). `failed=0`, image rebuilt via both handlers. `/api/kafka` →
+  ok:true, broker .127:9092, traffic total_end_offset 42.95M, 2 groups lag 0;
+  `/api/kafka/history` returns **721 rows** (the `_migrate()` ALTER worked — old
+  rows survived, new samples carry total_lag/consumer_groups/msgs_per_sec);
+  kafka.html 200. msgs_per_sec shows None while the ticks topic is idle (offset
+  stable) — it'll populate once producers resume.
+
+## 2026-06-14 — Argus: Internet QoS drill-down (merged URL trackers) — DEPLOYED
+- **Deployed to .128 + verified live** (`ansible-playbook playbook.yml --tags
+  monitoring --become-password-file <pw>`; vault.yml is plaintext-gitignored so no
+  vault pass; become pw lives in repo `.env` as `PASS`). Image rebuilt via the
+  Rebuild/Restart handlers, `failed=0`. `/api/internet` → `ok:true`, both URLs up:
+  api.massive.com 184ms (avg 184/p95 229/jitter 26.6/100%), google.com 372ms (avg
+  310/p95 402/jitter 55.7/100%), summary avg 247ms; `internet.html` serves 200;
+  history already had ~120 samples/URL (they were probed pre-existing since 6-12).
+- New drill-down **`internet.html`** (🌐 sky/azure accent) — a "Global URL
+  trackers" / quality-of-service panel that **merges the two internet-group
+  probes** (`google.com`, `api.massive.com`) into one view. On the dashboard the
+  two separate cards now collapse into a single **"Internet QoS"** card
+  (`renderInternetCard()` in `index.html`) that drills into the page; the other
+  cards still render 1:1 via the refactored `renderCard()`.
+- **No new sampling, no new table.** The internet probes already write
+  `status`+`latency_ms` to the `samples` table every cycle, so QoS is computed
+  straight from `store.history()`. New backend in `app.py`:
+  - `_qos_stats()` — per-URL uptime %, avg/min/max latency, **p95** (linear-interp
+    `_percentile()`), and **jitter** (mean abs delta between consecutive
+    latencies). Latency stats use successful probes only.
+  - `internet_snapshot()` — live status (in-memory ring) + QoS aggregates over
+    the last hour for every probe in `internet.group`.
+  - Endpoints: `/api/internet` (live + QoS, `?hours=` window) and
+    `/api/internet/history?hours=` (merged `{names, series}` — one call returns
+    every URL's latency/status trend for the multi-line chart).
+  - Loop: a reachable-but-slow URL (latency > `degrade_ms`) marks the panel
+    **degraded** (amber, via `state.set_degraded`) and posts **one panel-level**
+    Mattermost degraded↔recovered transition (not per-URL, so a flapping
+    endpoint can't spam) — reuses `post_perf`.
+- **Config** (`monitor_internet_*` in `defaults/main.yml` → `config.json.j2`):
+  `enable` (default true), `group` ("internet"), `poor_ms` (400, amber on page),
+  `degrade_ms` (800, panel degrades). Add more tracked URLs by appending probes
+  with `group: "internet"`. No Dockerfile/compose change (static dir is COPYed
+  wholesale; no new .py / env).
+- **Smoke-tested locally**: app boots, both pages serve 200, endpoints return
+  correct shape, QoS math verified against injected samples (uptime 10/16=62.5%,
+  avg 136, p95 522, jitter 196.4). Sandbox has no outbound net so live probes
+  read "down" here — real up/down + latency only show once deployed on .128.
+- ⚠️ **Not yet deployed** (same `--tags monitoring`, needs pinky sudo).
+
+## 2026-06-13 — Argus: Elasticsearch + Kafka drill-down pages
+- Added two full detail pages (drill-in from the index cards, like Mongo/Ollama):
+  **`elastic.html`** (teal accent, 🔎) and **`kafka.html`** (copper accent, "K"
+  medallion). Wired into `index.html`'s `detailPages` map by target name
+  (`elasticsearch` → `./elastic.html`, `kafka` → `./kafka.html`).
+- **New pure-stdlib clients** mirroring `mongo.py`/`ollama.py`:
+  - `elastic.py` — ES REST API (HTTP/JSON, the easy one). `health()` pulls
+    `/`, `/_cluster/health`, `/_cluster/stats`, `/_nodes/stats/...`,
+    `/_cat/indices` and curates: cluster status (green/yellow/red), shard
+    allocation, docs/store, per-node heap/cpu/gc/thread-pools/breakers/fds, and a
+    per-index table. Optional HTTP basic auth (username + `ES_PASSWORD` env);
+    the .127 target is anonymous http so it defaults off. `perf_sample()` is a
+    cheap 2-call (health + node stats) snapshot for the loop.
+  - `kafka.py` — **hand-rolled Kafka wire protocol** (binary TCP, no client lib;
+    same spirit as mongo's OP_MSG). Two requests on PRE-FLEXIBLE versions so
+    parsing stays trivial: **ApiVersions v0** (key 18) + **Metadata v1** (key 3,
+    topics=null → all). Derives the classic health signals from metadata:
+    brokers, active controller, topics/partitions, **under-replicated** (ISR <
+    replicas) and **offline** (no leader) partitions, plus per-broker leader
+    counts. Assumes a PLAINTEXT listener. Round-trip + curation unit-tested
+    locally (synthetic frames) before wiring.
+- **Backend wiring** (`app.py`): `/api/elastic` + `/api/kafka` (live) and
+  `/api/elastic/history` + `/api/kafka/history` (SQLite trends). Loop samples
+  both each cycle → `elastic_perf` / `kafka_perf` tables (new in `store.py`,
+  added to prune), computes ES search/index **QPS from counter deltas** (stored +
+  exposed live via `elastic_latest` → `data.rates`), and posts Mattermost
+  **degraded↔recovered** transition alerts (reusing `post_perf`). Degrade rules:
+  ES → RED status / heap>`heap_pct` / cpu>`cpu_pct` / thread-pool rejections
+  always; **yellow only when `monitor_elastic_degrade_on_yellow`** (default
+  false — single-node clusters sit yellow as steady state). Kafka → offline or
+  under-replicated partitions / missing controller / brokers < `min_brokers`.
+- Charts: ES page trends **max heap% + cpu%** (fixed 0–100 axis); Kafka page
+  trends **under-replicated + offline** partition counts (auto-scaled). Both have
+  the 1H/6H/1D/1W range selector pattern from the Ollama page.
+- **Config**: `monitor_elastic_*` / `monitor_kafka_*` in `defaults/main.yml`,
+  rendered into `config.json.j2`; `ES_PASSWORD` added to `docker-compose.yml.j2`
+  env (alongside MM_TOKEN / OLLAMA_API_KEY); `Dockerfile` COPY now includes
+  `elastic.py kafka.py`. Both default **enabled** against `.127` (`:9200` /
+  `:9092`). Verified: full server boots, serves both pages (200), endpoints
+  return clean `ok:false` on unreachable, eval logic + QPS deltas correct.
+- ⚠️ **Not yet deployed / not integration-tested against the REAL .127 ES &
+  Kafka** — only local unit/smoke tests (couldn't reach .127 from here). First
+  deploy (`--tags monitoring`, needs pinky sudo) is the real validation; watch
+  for ES security-on (would need https+auth) or a non-PLAINTEXT Kafka listener.
+
 ## 2026-06-07 — Argus: split host charts + cleared latency history
 - Per user, **split the combined host CPU+Mem dual-line chart into two separate
   single-line charts** (`#cpuChart` gold, `#memChart` sky), side-by-side under the

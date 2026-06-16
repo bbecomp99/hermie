@@ -4,25 +4,29 @@ hermes_repo: "https://github.com/NousResearch/hermes-agent.git"
 hermes_version: "a6e47314f98cccb09f302ad649d8bec30e4b4a2d"  # pinned to the running commit; bump deliberately
 
 # --- LLM target ---
-# The agent talks to Ollama running on the Mac (192.168.88.127:11434) over the
-# OpenAI-compatible API. These three keys are written into the `model:` block of
-# ~/.hermes/config.yaml. Switched off MLX (:8080) because mlx_lm.server cannot
-# emit structured tool_calls (tool_turns=0); Ollama returns real tool calls.
+# The agent talks to Ollama Cloud (ollama.com) over the OpenAI-compatible API.
+# These keys are written into the `model:` block of ~/.hermes/config.yaml.
+# `provider: custom` = generic OpenAI-compatible endpoint; `api_key` carries the
+# Bearer token (ollama.com requires auth — local Ollama did not, so this field is
+# new). Switched off MLX (:8080) because mlx_lm.server cannot emit structured
+# tool_calls (tool_turns=0); Ollama returns real tool calls.
 #
-# `default` is a custom Ollama model `lfm2.5:8b-hermes` = LiquidAI lfm2.5:8b (an
-# 8.5B MoE, natively 128K ctx, native tool-calling) with `num_ctx 65536` baked in
-# via a Modelfile, because Hermes Agent refuses any model under 64K context and
-# the OpenAI API can't pass num_ctx. Loads ~5.5GB on Metal (q4_0 KV cache) — over
-# the original 4-4.5GB target, but the 16GB M1 Pro has headroom, and the 8B is far
-# better at tool-calling than the 3B (which conflated check_stock's `symbol` arg
-# with Home Assistant's `entity_id`). Recreate on the Mac with:
-#   printf 'FROM lfm2.5:8b\nPARAMETER num_ctx 65536\n' | ollama create lfm2.5:8b-hermes -f -
-# (History: llama3.2:3b-hermes fit the budget at ~4.3GB but was too weak to pick
-# the right tool; Qwen2.5-7B caps at 32K so it couldn't clear the 64K floor.)
+# `default` is the cloud model `qwen3-next:80b` (80B MoE) — a clean instruct/
+# tool-calling model that emits structured tool_calls over the OpenAI /v1 path and
+# has a 128K+ window, clearing the 64K floor Hermes Agent enforces (no Modelfile/
+# num_ctx needed on cloud — the served context is the model's full window).
+# Replaced the local `lfm2.5:8b-hermes` when local Ollama was retired off the 16GB
+# Mac. (History: tried cloud `gpt-oss:20b` first, but it's a reasoning/harmony
+# model — over /v1 ollama.com returns empty content or a raw `…assistantfinal…`
+# blob instead of clean content/tool_calls, so the agent got "Empty response from
+# model". qwen3-next returns proper tool_calls. Local path baked num_ctx 65536 via
+# a Modelfile because the OpenAI API can't pass num_ctx; llama3.2:3b-hermes was too
+# weak at tool-choice; Qwen2.5-7B capped at 32K.)
 # MLX still runs on :8080 for the separately-managed ai-serve/stonks coding model.
-hermes_model_default: "lfm2.5:8b-hermes"
+hermes_model_default: "qwen3-next:80b"
 hermes_model_provider: "custom"
-hermes_model_base_url: "http://192.168.88.127:11434/v1"
+hermes_model_base_url: "https://ollama.com/v1"
+hermes_model_api_key: "{{ ollama_api_key }}"   # from group_vars/hermes/vault.yml
 
 # --- Web dashboard (always-on systemd service) ---
 # LAN-exposed (--insecure) on a trusted home network, same trust model as the

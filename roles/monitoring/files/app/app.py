@@ -6,7 +6,8 @@ serves a JSON status API + an astonks-styled dashboard, and posts to Mattermost
 on every up<->down transition. Pure stdlib so the image stays ~50MB.
 
 Config: JSON file at $CONFIG_PATH (default /app/config.json).
-Secrets: Mattermost bot token via $MM_TOKEN (never in the config file).
+Secrets: Mattermost bot token via $MM_TOKEN and the Ollama Cloud key via
+$OLLAMA_API_KEY (never in the config file).
 """
 import json
 import os
@@ -20,7 +21,9 @@ from collections import deque
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+import elastic
 import hoststat
+import kafka
 import mongo
 import ollama
 import store as store_mod
@@ -64,12 +67,35 @@ def load_config():
     hm.setdefault("known_hosts", "/app/.ssh/known_hosts")
     ol = cfg.setdefault("ollama", {})
     ol.setdefault("enable", False)
-    ol.setdefault("host", "")
-    ol.setdefault("port", 11434)
-    ol.setdefault("model", "")            # blank → auto (use the loaded model)
+    ol.setdefault("base_url", "")          # Ollama Cloud endpoint (https://ollama.com)
+    # Bearer token injected via env, never persisted in the 0644 config file.
+    ol["api_key"] = os.environ.get("OLLAMA_API_KEY", "")
+    ol.setdefault("model", "")             # model to canary (cloud has no resident)
     ol.setdefault("canary_interval", 900)  # seconds between throughput canaries
     ol.setdefault("num_predict", 16)       # tokens generated per canary
-    ol.setdefault("timeout", 120)          # generous: canary may queue behind agent
+    ol.setdefault("timeout", 120)          # generous: canary may queue server-side
+    es = cfg.setdefault("elastic", {})
+    es.setdefault("enable", False)
+    es.setdefault("url", "")               # ES REST base (http://host:9200)
+    es.setdefault("username", "")          # optional HTTP basic auth (anon by default)
+    es["password"] = os.environ.get("ES_PASSWORD", "")  # injected via env, never in config
+    es.setdefault("heap_pct", 85)          # degrade if any node's JVM heap exceeds this
+    es.setdefault("cpu_pct", 90)           # degrade if any node's CPU exceeds this
+    es.setdefault("degrade_on_yellow", False)  # single-node clusters sit yellow normally
+    kf = cfg.setdefault("kafka", {})
+    kf.setdefault("enable", False)
+    kf.setdefault("host", "")
+    kf.setdefault("port", 9092)
+    kf.setdefault("client_id", "argus")
+    kf.setdefault("min_brokers", 1)        # degrade if fewer brokers than this are up
+    kf.setdefault("track_traffic", True)   # pull log-end offsets → throughput
+    kf.setdefault("track_lag", True)        # pull consumer-group committed offsets → lag
+    kf.setdefault("lag_degrade", 0)        # total lag above this degrades (0 = display only)
+    it = cfg.setdefault("internet", {})
+    it.setdefault("enable", False)
+    it.setdefault("group", "internet")     # probe group that feeds the QoS panel
+    it.setdefault("poor_ms", 400)          # latency above this is "poor" (amber)
+    it.setdefault("degrade_ms", 800)       # reachable but slower than this => degraded
     return cfg
 
 
@@ -146,6 +172,8 @@ class State:
                 "label": t.get("label", _describe(t)),
                 "status": "unknown",   # up | down | unknown
                 "detail": "",
+                "degraded": False,
+                "degraded_detail": "",
                 "latency_ms": None,
                 "since": None,         # ISO ts of the current status
                 "last_checked": None,
@@ -158,6 +186,12 @@ class State:
         with self.lock:
             if name in self.targets and hist:
                 self.targets[name]["history"].extend(hist)
+
+    def set_degraded(self, name, is_degraded, detail=""):
+        with self.lock:
+            if name in self.targets:
+                self.targets[name]["degraded"] = is_degraded
+                self.targets[name]["degraded_detail"] = detail
 
     def update(self, name, ok, latency, detail):
         now = datetime.now(timezone.utc)
@@ -182,17 +216,21 @@ class State:
             for s in self.targets.values():
                 hist = list(s["history"])
                 uptime = round(100 * sum(hist) / len(hist), 1) if hist else None
-                if s["status"] == "up":
+                
+                status_out = "degraded" if s["status"] == "up" and s.get("degraded") else s["status"]
+                detail_out = s["degraded_detail"] if status_out == "degraded" and s.get("degraded_detail") else s["detail"]
+                
+                if status_out in ("up", "degraded"):
                     up += 1
-                elif s["status"] == "down":
+                elif status_out == "down":
                     down += 1
                 out.append({
                     "name": s["name"],
                     "group": s["group"],
                     "kind": s["kind"],
                     "label": s["label"],
-                    "status": s["status"],
-                    "detail": s["detail"],
+                    "status": status_out,
+                    "detail": detail_out,
                     "latency_ms": s["latency_ms"],
                     "since": s["since"],
                     "last_checked": s["last_checked"],
@@ -213,6 +251,96 @@ def _describe(t):
     if t["type"] == "tcp":
         return f"tcp://{t['host']}:{t['port']}"
     return t["type"]
+
+
+# ---------------------------------------------------------------------------
+# Internet QoS — aggregate the "internet"-group probes into a quality-of-service
+# view (uptime, avg/p95 latency, jitter). No new sampling or table: the per-cycle
+# status + latency_ms for these targets is already persisted to `samples`, so the
+# QoS stats are computed straight from store.history().
+# ---------------------------------------------------------------------------
+
+
+def _percentile(values, pct):
+    """Linear-interpolated percentile of a value list (values need not be sorted)."""
+    if not values:
+        return None
+    s = sorted(values)
+    k = (len(s) - 1) * pct / 100.0
+    f = int(k)
+    c = min(f + 1, len(s) - 1)
+    if f == c:
+        return s[f]
+    return s[f] + (s[c] - s[f]) * (k - f)
+
+
+def _qos_stats(store, name, hours):
+    """QoS aggregates for one URL from the samples table: uptime %, latency
+    avg/min/max/p95, and jitter (mean abs delta between consecutive latencies).
+    Latency stats use successful probes only — a failed probe's latency is just
+    the time-to-failure and would skew the numbers."""
+    rows = store.history(name, hours=hours) if store else []
+    if not rows:
+        return {"samples": 0, "uptime_pct": None, "avg_ms": None, "min_ms": None,
+                "max_ms": None, "p95_ms": None, "jitter_ms": None}
+    ups = sum(1 for r in rows if r["status"] == "up")
+    lat = [r["latency_ms"] for r in rows
+           if r["status"] == "up" and r["latency_ms"] is not None]
+    jitter = None
+    if len(lat) >= 2:
+        diffs = [abs(lat[i] - lat[i - 1]) for i in range(1, len(lat))]
+        jitter = round(sum(diffs) / len(diffs), 1)
+    return {
+        "samples": len(rows),
+        "uptime_pct": round(100 * ups / len(rows), 1),
+        "avg_ms": round(sum(lat) / len(lat)) if lat else None,
+        "min_ms": min(lat) if lat else None,
+        "max_ms": max(lat) if lat else None,
+        "p95_ms": round(_percentile(lat, 95)) if lat else None,
+        "jitter_ms": jitter,
+    }
+
+
+def internet_snapshot(state, store, int_cfg, hours=1):
+    """Live status (from the in-memory ring) + QoS aggregates (from SQLite) for
+    every probe in the configured internet group — the Global URL trackers."""
+    group = int_cfg.get("group", "internet")
+    urls = []
+    up = down = degraded = 0
+    avg_acc = []
+    for t in state.snapshot()["targets"]:
+        if t.get("group") != group:
+            continue
+        qos = _qos_stats(store, t["name"], hours)
+        urls.append({
+            "name": t["name"], "label": t["label"], "group": t["group"],
+            "status": t["status"], "latency_ms": t["latency_ms"],
+            "uptime": t["uptime"], "since": t["since"],
+            "last_checked": t["last_checked"], "detail": t["detail"],
+            "spark": t["spark"], "qos": qos,
+        })
+        if t["status"] == "down":
+            down += 1
+        elif t["status"] == "degraded":
+            degraded += 1
+        else:
+            up += 1
+        if qos.get("avg_ms") is not None:
+            avg_acc.append(qos["avg_ms"])
+    urls.sort(key=lambda u: u["name"])
+    return {
+        "ok": True,
+        "generated": datetime.now(timezone.utc).isoformat(),
+        "group": group,
+        "hours": hours,
+        "thresholds": {"poor_ms": int_cfg.get("poor_ms", 400),
+                       "degrade_ms": int_cfg.get("degrade_ms", 800)},
+        "summary": {
+            "total": len(urls), "up": up, "down": down, "degraded": degraded,
+            "avg_ms": round(sum(avg_acc) / len(avg_acc)) if avg_acc else None,
+        },
+        "urls": urls,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -322,7 +450,84 @@ def post_mongo_perf(mm, degraded, reasons):
     post_mattermost(mm, text)
 
 
-def monitor_loop(cfg, state, store=None, host_latest=None):
+def eval_elastic_perf(prev, cur, thr, dt):
+    """Compare two elastic.perf_sample()s → (degraded, reasons, metrics). Cluster
+    RED and saturation (heap / cpu / thread-pool rejections) always degrade; a
+    yellow status (normal for single-node clusters with replicas) only degrades
+    when degrade_on_yellow is set. QPS is derived from cumulative-counter deltas."""
+    m = {
+        "status": cur.get("status"), "nodes": cur.get("nodes"),
+        "unassigned": cur.get("unassigned"), "heap_pct": cur.get("heap_pct"),
+        "cpu_pct": cur.get("cpu_pct"), "search_qps": None, "index_qps": None,
+    }
+    rej = 0
+    if prev and dt > 0:
+        ds = (cur.get("search_total") or 0) - (prev.get("search_total") or 0)
+        di = (cur.get("index_total") or 0) - (prev.get("index_total") or 0)
+        m["search_qps"] = round(ds / dt, 2) if ds >= 0 else None
+        m["index_qps"] = round(di / dt, 2) if di >= 0 else None
+        rej = (cur.get("rejected") or 0) - (prev.get("rejected") or 0)
+
+    reasons = []
+    st = cur.get("status")
+    if st == "red":
+        reasons.append("cluster status RED")
+    elif st == "yellow" and thr.get("degrade_on_yellow"):
+        reasons.append("cluster status yellow")
+        if (cur.get("unassigned") or 0) > 0:
+            reasons.append(f"{cur['unassigned']} unassigned shard(s)")
+    if cur.get("heap_pct") is not None and cur["heap_pct"] > thr["heap_pct"]:
+        reasons.append(f"heap {cur['heap_pct']:.0f}% (>{thr['heap_pct']})")
+    if cur.get("cpu_pct") is not None and cur["cpu_pct"] > thr["cpu_pct"]:
+        reasons.append(f"cpu {cur['cpu_pct']:.0f}% (>{thr['cpu_pct']})")
+    if rej > 0:
+        reasons.append(f"{rej} thread-pool rejection(s)")
+    return bool(reasons), reasons, m
+
+
+def eval_kafka_perf(prev, cur, thr, dt):
+    """Derive (degraded, reasons, metrics) from two kafka.perf_sample()s. Cluster
+    signals are instantaneous (offline / under-replicated partitions, a missing
+    controller, a shrunken broker count); throughput (msgs/sec) comes from the
+    log-end-offset delta, and consumer lag degrades only above lag_degrade (>0)."""
+    m = {k: cur.get(k) for k in
+         ("brokers", "topics", "partitions", "under_replicated", "offline")}
+    m["total_lag"] = cur.get("total_lag")
+    m["consumer_groups"] = cur.get("consumer_groups")
+    m["msgs_per_sec"] = None
+    if prev and dt > 0:
+        de = (cur.get("total_end_offset") or 0) - (prev.get("total_end_offset") or 0)
+        m["msgs_per_sec"] = round(de / dt, 2) if de >= 0 else None  # counter reset → skip
+
+    reasons = []
+    if (cur.get("offline") or 0) > 0:
+        reasons.append(f"{cur['offline']} offline partition(s)")
+    if (cur.get("under_replicated") or 0) > 0:
+        reasons.append(f"{cur['under_replicated']} under-replicated partition(s)")
+    if not cur.get("has_controller"):
+        reasons.append("no active controller")
+    if cur.get("brokers") is not None and cur["brokers"] < thr["min_brokers"]:
+        reasons.append(f"only {cur['brokers']} broker(s) (<{thr['min_brokers']})")
+    lag_deg = thr.get("lag_degrade", 0)
+    if lag_deg and (cur.get("total_lag") or 0) > lag_deg:
+        reasons.append(f"consumer lag {cur['total_lag']:,} (>{lag_deg:,})")
+    return bool(reasons), reasons, m
+
+
+def post_perf(mm, name, degraded, reasons):
+    """Mattermost transition alert for a service's degraded<->healthy flip."""
+    if not mm.get("enable"):
+        return
+    if degraded:
+        text = f"👁 **Argus** · :warning: **{name} degraded** — " + "; ".join(reasons)
+    else:
+        text = (f"👁 **Argus** · :large_green_circle: **{name} recovered** — "
+                "back to normal")
+    post_mattermost(mm, text)
+
+
+def monitor_loop(cfg, state, store=None, host_latest=None,
+                 elastic_latest=None, kafka_latest=None):
     targets = {t["name"]: t for t in cfg["targets"]}
     interval = cfg["interval"]
     hb_interval = cfg["heartbeat_interval"]
@@ -330,10 +535,22 @@ def monitor_loop(cfg, state, store=None, host_latest=None):
     mm = cfg["mattermost"]
     mp = cfg["mongo_perf"]
     hm = cfg["host_metrics"]
+    es = cfg["elastic"]
+    kf = cfg["kafka"]
+    it = cfg["internet"]
+    internet_group = it.get("group", "internet")
+    internet_degrade_ms = int(it.get("degrade_ms", 800))
+    internet_names = {t["name"] for t in cfg["targets"]
+                      if t.get("group") == internet_group and t["type"] == "http"}
+    internet_degraded = False  # last posted panel state (alert on transitions only)
     mongo_t = next((t for t in cfg["targets"]
                     if t["type"] == "tcp" and "mongo" in t["name"].lower()), None)
     mongo_prev = None      # previous perf_sample for delta-based latency
     mongo_degraded = False  # last posted state (alert only on transitions)
+    es_prev = None         # previous ES perf_sample for delta-based QPS
+    es_degraded = False
+    kafka_prev = None      # previous Kafka perf_sample for delta-based throughput
+    kafka_degraded = False
     # Count the heartbeat clock from startup, so the first one lands a full
     # interval in (no spam on every redeploy/restart).
     last_heartbeat = time.monotonic()
@@ -357,11 +574,35 @@ def monitor_loop(cfg, state, store=None, host_latest=None):
         if store and cycle_rows:
             store.insert_samples(cycle_rows)
 
+        # Internet QoS: a reachable-but-slow URL degrades the panel (amber on the
+        # dashboard + drill-down). One panel-level Mattermost transition, not per
+        # URL, so a flapping endpoint can't spam the channel.
+        if it["enable"] and internet_names:
+            slow = []
+            for nm, new, latency in cycle_rows:
+                if nm not in internet_names:
+                    continue
+                deg = new == "up" and latency is not None and latency > internet_degrade_ms
+                state.set_degraded(
+                    nm, deg,
+                    f"latency {latency}ms (>{internet_degrade_ms}ms)" if deg else "")
+                if deg:
+                    slow.append(f"{nm} {latency}ms")
+            if bool(slow) != internet_degraded:
+                internet_degraded = bool(slow)
+                post_perf(mm, "Internet QoS", internet_degraded, slow)
+                if store:
+                    store.insert_event(
+                        "internet", "perf",
+                        ("degraded: " + "; ".join(slow)) if internet_degraded
+                        else "recovered")
+
         if mp["enable"] and mongo_t is not None:
             cur = mongo.perf_sample(mongo_t["host"], int(mongo_t["port"]),
                                     timeout=mongo_t.get("timeout", 5))
             if cur and mongo_prev:
                 degraded, reasons, metrics = eval_mongo_perf(mongo_prev, cur, mp)
+                state.set_degraded(mongo_t["name"], degraded, "; ".join(reasons))
                 print(f"[argus] mongo perf {'DEGRADED' if degraded else 'ok'} "
                       f"{metrics}", flush=True)
                 if store:
@@ -376,6 +617,62 @@ def monitor_loop(cfg, state, store=None, host_latest=None):
                             else "recovered")
             if cur:
                 mongo_prev = cur
+
+        if es["enable"] and es["url"]:
+            cur = elastic.perf_sample(es["url"], es.get("username", ""),
+                                      es.get("password", ""), timeout=8)
+            if cur:
+                degraded, reasons, metrics = eval_elastic_perf(
+                    es_prev, cur, es, dt=interval)
+                state.set_degraded("elasticsearch", degraded, "; ".join(reasons))
+                if elastic_latest is not None:
+                    elastic_latest.clear()
+                    elastic_latest.update(metrics)
+                print(f"[argus] elastic {cur.get('status')} heap={cur.get('heap_pct')}% "
+                      f"cpu={cur.get('cpu_pct')}% unassigned={cur.get('unassigned')}"
+                      f"{' DEGRADED' if degraded else ''}", flush=True)
+                if store:
+                    store.insert_elastic_perf(metrics)
+                if degraded != es_degraded:
+                    es_degraded = degraded
+                    post_perf(mm, "Elasticsearch", degraded, reasons)
+                    if store:
+                        store.insert_event(
+                            "elasticsearch", "perf",
+                            ("degraded: " + "; ".join(reasons)) if degraded
+                            else "recovered")
+                es_prev = cur
+
+        if kf["enable"] and kf["host"]:
+            cur = kafka.perf_sample(
+                kf["host"], int(kf["port"]), kf.get("client_id", "argus"),
+                timeout=5, track_traffic=kf.get("track_traffic", True),
+                track_lag=kf.get("track_lag", True))
+            if cur:
+                degraded, reasons, metrics = eval_kafka_perf(
+                    kafka_prev, cur, kf, dt=interval)
+                state.set_degraded("kafka", degraded, "; ".join(reasons))
+                if kafka_latest is not None:
+                    kafka_latest.clear()
+                    kafka_latest.update(metrics)
+                print(f"[argus] kafka brokers={cur.get('brokers')} "
+                      f"partitions={cur.get('partitions')} "
+                      f"under_repl={cur.get('under_replicated')} "
+                      f"offline={cur.get('offline')} "
+                      f"lag={cur.get('total_lag')} "
+                      f"msg/s={metrics.get('msgs_per_sec')}"
+                      f"{' DEGRADED' if degraded else ''}", flush=True)
+                if store:
+                    store.insert_kafka_perf(metrics)
+                if degraded != kafka_degraded:
+                    kafka_degraded = degraded
+                    post_perf(mm, "Kafka", degraded, reasons)
+                    if store:
+                        store.insert_event(
+                            "kafka", "perf",
+                            ("degraded: " + "; ".join(reasons)) if degraded
+                            else "recovered")
+                kafka_prev = cur
 
         if hm["enable"] and hm["ssh_host"]:
             hs = hoststat.sample(hm["ssh_user"], hm["ssh_host"],
@@ -410,41 +707,33 @@ def monitor_loop(cfg, state, store=None, host_latest=None):
 
 
 def canary_loop(cfg, store=None, ollama_latest=None):
-    """Periodically measure Ollama throughput (tok/s) WITHOUT disturbing the
-    shared production model. Only ever probes a model that is already resident,
-    reusing its exact runner (matched num_ctx + keep_alive=-1) — it never loads,
-    reloads, resizes, or unloads anything. Runs on its own thread so a slow /
-    queued generation can't delay the black-box probe cycle.
-
-    monitor_ollama_model (if set) is a filter: probe ONLY when that model is the
-    one loaded; otherwise we probe whatever is loaded."""
+    """Periodically measure Ollama Cloud round-trip throughput (tok/s) by running
+    a tiny generation against the configured model. Cloud is serverless — there's
+    no resident model to detect — and EACH canary is a real billed generation, so
+    it's kept tiny + infrequent. Runs on its own thread so a slow / queued
+    generation can't delay the black-box probe cycle."""
     ol = cfg["ollama"]
     interval = max(60, int(ol.get("canary_interval", 900)))
     timeout = int(ol.get("timeout", 120))
-    want = (ol.get("model") or "").strip()
+    base = ol.get("base_url", "")
+    api_key = ol.get("api_key", "")
+    model = (ol.get("model") or "").strip()
     while True:
-        lm = ollama.loaded(ol["host"], int(ol["port"]), timeout=8)
-        if lm is None:
-            print("[argus] ollama canary skipped — no model resident "
-                  "(won't trigger a load)", flush=True)
-        elif want and want != lm["model"]:
-            print(f"[argus] ollama canary skipped — {lm['model']} loaded, "
-                  f"not {want}", flush=True)
+        if not model:
+            print("[argus] ollama canary skipped — no model configured",
+                  flush=True)
         else:
-            res = ollama.canary(ol["host"], int(ol["port"]), lm["model"],
-                                num_ctx=lm.get("context_length"),
+            res = ollama.canary(base, api_key, model,
                                 num_predict=int(ol.get("num_predict", 16)),
-                                keep_alive=-1, timeout=timeout)
+                                timeout=timeout)
             if res:
-                res["context_length"] = lm.get("context_length")
                 res["fetched"] = datetime.now(timezone.utc).isoformat()
                 if ollama_latest is not None:
                     ollama_latest.clear()
                     ollama_latest.update(res)
                 print(f"[argus] ollama canary {res['model']} "
-                      f"(ctx {lm.get('context_length')}) "
-                      f"eval={res['eval_tps']} tok/s prompt={res['prompt_tps']} "
-                      f"tok/s load={res['load_ms']}ms", flush=True)
+                      f"eval={res['eval_tps']} tok/s "
+                      f"total={res['total_ms']}ms", flush=True)
                 if store:
                     store.insert_ollama_perf(res)
         time.sleep(interval)
@@ -455,13 +744,17 @@ def canary_loop(cfg, store=None, ollama_latest=None):
 # ---------------------------------------------------------------------------
 
 
-def make_handler(state, cfg, store=None, host_latest=None, ollama_latest=None):
+def make_handler(state, cfg, store=None, host_latest=None, ollama_latest=None,
+                 elastic_latest=None, kafka_latest=None):
     # The mongo detail endpoint targets the first tcp probe named like "mongo".
     mongo_target = next(
         (t for t in cfg["targets"]
          if t["type"] == "tcp" and "mongo" in t["name"].lower()), None)
     hm_host = cfg["host_metrics"].get("ssh_host", "")
     ol_cfg = cfg["ollama"]
+    es_cfg = cfg["elastic"]
+    kf_cfg = cfg["kafka"]
+    int_cfg = cfg["internet"]
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *args):  # silence per-request logging
@@ -502,11 +795,12 @@ def make_handler(state, cfg, store=None, host_latest=None, ollama_latest=None):
                     self._send(200, json.dumps(
                         store.host_history(hm_host, hours=hours)).encode())
             elif path == "/api/ollama":
-                if not ol_cfg.get("enable") or not ol_cfg.get("host"):
+                if not ol_cfg.get("enable") or not ol_cfg.get("base_url"):
                     self._send(404, b'{"ok":false,"error":"ollama not configured"}')
                 else:
-                    data = ollama.health(ol_cfg["host"], int(ol_cfg["port"]),
-                                         timeout=8)
+                    data = ollama.health(ol_cfg["base_url"],
+                                         ol_cfg.get("api_key", ""),
+                                         ol_cfg.get("model", ""), timeout=8)
                     if ollama_latest:
                         data["canary"] = dict(ollama_latest)
                     self._send(200, json.dumps(data).encode())
@@ -518,6 +812,65 @@ def make_handler(state, cfg, store=None, host_latest=None, ollama_latest=None):
                     hours = float(q.get("hours", ["24"])[0])
                     self._send(200, json.dumps(
                         store.ollama_history(hours=hours)).encode())
+            elif path == "/api/elastic":
+                if not es_cfg.get("enable") or not es_cfg.get("url"):
+                    self._send(404, b'{"ok":false,"error":"elasticsearch not configured"}')
+                else:
+                    data = elastic.health(es_cfg["url"], es_cfg.get("username", ""),
+                                          es_cfg.get("password", ""), timeout=8)
+                    if elastic_latest:
+                        data["rates"] = dict(elastic_latest)
+                    self._send(200, json.dumps(data).encode())
+            elif path == "/api/elastic/history":
+                if store is None:
+                    self._send(200, b"[]")
+                else:
+                    q = self._query()
+                    hours = float(q.get("hours", ["6"])[0])
+                    self._send(200, json.dumps(
+                        store.elastic_history(hours=hours)).encode())
+            elif path == "/api/kafka":
+                if not kf_cfg.get("enable") or not kf_cfg.get("host"):
+                    self._send(404, b'{"ok":false,"error":"kafka not configured"}')
+                else:
+                    data = kafka.health(
+                        kf_cfg["host"], int(kf_cfg["port"]),
+                        kf_cfg.get("client_id", "argus"), timeout=5,
+                        track_traffic=kf_cfg.get("track_traffic", True),
+                        track_lag=kf_cfg.get("track_lag", True))
+                    if kafka_latest:
+                        data["rates"] = dict(kafka_latest)  # loop-computed msgs/sec
+                    self._send(200, json.dumps(data).encode())
+            elif path == "/api/kafka/history":
+                if store is None:
+                    self._send(200, b"[]")
+                else:
+                    q = self._query()
+                    hours = float(q.get("hours", ["6"])[0])
+                    self._send(200, json.dumps(
+                        store.kafka_history(hours=hours)).encode())
+            elif path == "/api/internet":
+                if not int_cfg.get("enable"):
+                    self._send(404, b'{"ok":false,"error":"internet qos not configured"}')
+                else:
+                    q = self._query()
+                    hours = float(q.get("hours", ["1"])[0])
+                    self._send(200, json.dumps(
+                        internet_snapshot(state, store, int_cfg, hours=hours)).encode())
+            elif path == "/api/internet/history":
+                # Merged per-URL latency/status trend for the QoS chart — one call
+                # returns every tracked URL's series (reusing the samples table).
+                if store is None:
+                    self._send(200, b'{"names":[],"series":{}}')
+                else:
+                    q = self._query()
+                    hours = float(q.get("hours", ["6"])[0])
+                    group = int_cfg.get("group", "internet")
+                    names = [t["name"] for t in cfg["targets"]
+                             if t.get("group") == group and t["type"] == "http"]
+                    series = {n: store.history(n, hours=hours) for n in names}
+                    self._send(200, json.dumps(
+                        {"names": names, "series": series}).encode())
             elif path == "/api/mongo/history":
                 if store is None:
                     self._send(200, b"[]")
@@ -571,15 +924,19 @@ def main():
         print(f"[argus] persistence DISABLED: {type(exc).__name__}: {exc}", flush=True)
         store = None
 
-    host_latest = {}  # shared: loop writes the newest host CPU/mem, handler reads
-    t = threading.Thread(target=monitor_loop,
-                         args=(cfg, state, store, host_latest), daemon=True)
+    host_latest = {}     # shared: loop writes the newest host CPU/mem, handler reads
+    elastic_latest = {}  # shared: loop writes derived ES rates, handler attaches them
+    kafka_latest = {}    # shared: loop writes the newest Kafka summary counts
+    t = threading.Thread(
+        target=monitor_loop,
+        args=(cfg, state, store, host_latest, elastic_latest, kafka_latest),
+        daemon=True)
     t.start()
 
     # Ollama throughput canary on its own thread (slow generations must not
     # block probes); handler reads the newest sample from ollama_latest.
     ollama_latest = {}
-    if cfg["ollama"]["enable"] and cfg["ollama"]["host"]:
+    if cfg["ollama"]["enable"] and cfg["ollama"]["base_url"]:
         threading.Thread(target=canary_loop,
                          args=(cfg, store, ollama_latest), daemon=True).start()
 
@@ -587,10 +944,13 @@ def main():
     print(f"[argus] serving on :{port}, {len(cfg['targets'])} targets, "
           f"interval={cfg['interval']}s, mattermost={cfg['mattermost']['enable']}, "
           f"host_metrics={cfg['host_metrics']['enable']}, "
-          f"ollama={cfg['ollama']['enable']}", flush=True)
+          f"ollama={cfg['ollama']['enable']}, elastic={cfg['elastic']['enable']}, "
+          f"kafka={cfg['kafka']['enable']}, internet={cfg['internet']['enable']}",
+          flush=True)
     ThreadingHTTPServer(("0.0.0.0", port),
                         make_handler(state, cfg, store, host_latest,
-                                     ollama_latest)).serve_forever()
+                                     ollama_latest, elastic_latest,
+                                     kafka_latest)).serve_forever()
 
 
 if __name__ == "__main__":

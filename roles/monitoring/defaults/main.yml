@@ -32,20 +32,69 @@ monitor_host_metrics_host: "{{ monitor_host_142 }}"
 monitor_ssh_key_src: "{{ ansible_env.HOME }}/.ssh/id_rsa"        # key copied into the data dir
 monitor_ssh_known_hosts_src: "{{ ansible_env.HOME }}/.ssh/known_hosts"
 
-# Ollama LLM drill-down — live model state (/api/ps, /api/tags, /api/show) plus a
-# periodic "canary" generation that measures throughput (tok/s), since Ollama has
-# NO passive metrics endpoint. NON-DISRUPTIVE by design: the model is shared with
-# the live agent, so the canary only probes a model that is ALREADY resident and
-# reuses its exact runner (matched num_ctx + keep_alive=-1) — it never loads,
-# reloads, resizes, or unloads anything. If nothing is loaded it skips. Runs on
-# its own thread; persisted to SQLite like the other history.
+# Ollama Cloud (ollama.com) drill-down — live state (/api/version, /api/tags
+# catalog, /api/show on the active model) plus a periodic "canary" generation
+# that measures round-trip throughput (tok/s), since Ollama has NO passive
+# metrics endpoint. NOTE: this is a hosted, SERVERLESS service — there is no
+# resident model / VRAM / keep-alive (those are local-only concepts), and EACH
+# canary is a real BILLED generation against the cloud account. Kept tiny
+# (num_predict) and infrequent (canary_interval) so the cost stays negligible.
+# Runs on its own thread; persisted to SQLite like the other history.
 monitor_ollama_enable: true
-monitor_ollama_host: "{{ monitor_host_127 }}"   # the Ollama box (.127)
-monitor_ollama_port: 11434
-monitor_ollama_model: ""                         # blank = probe whatever is loaded;
-                                                 # set a name to probe ONLY that model
+monitor_ollama_base_url: "https://ollama.com"    # Ollama Cloud endpoint
+monitor_ollama_api_key: "{{ ollama_api_key }}"   # from group_vars/hermes/vault.yml
+monitor_ollama_model: "qwen3-next:80b"           # model to canary (cloud has no
+                                                 # resident model to auto-detect)
 monitor_ollama_canary_interval: 900              # seconds between canaries (15 min)
 monitor_ollama_num_predict: 16                   # tokens generated per canary (tiny)
+
+# Elasticsearch drill-down — live cluster/node/index state via the ES REST API
+# (cluster health, /_cluster/stats, per-node /_nodes/stats: heap, cpu, gc, thread
+# pools, circuit breakers, /_cat/indices). Each probe cycle also samples the
+# saturation primitives into SQLite for trend charts, and posts a Mattermost
+# alert on transition into/out of "degraded". RED status + heap/cpu over the
+# ceilings + thread-pool rejections always degrade; a yellow cluster only degrades
+# when monitor_elastic_degrade_on_yellow is true (single-node clusters with
+# replicas sit yellow as their normal steady state). The .127 target runs http
+# with security disabled, so basic-auth creds default empty.
+monitor_elastic_enable: true
+monitor_elastic_url: "http://{{ monitor_host_127 }}:9200"
+monitor_elastic_username: ""                      # optional HTTP basic auth user
+monitor_elastic_password: ""                      # injected via ES_PASSWORD env (vault if set)
+monitor_elastic_heap_pct: 85                      # degrade if any node's JVM heap > this
+monitor_elastic_cpu_pct: 90                       # degrade if any node's CPU > this
+monitor_elastic_degrade_on_yellow: false          # don't sit amber on expected single-node yellow
+
+# Kafka drill-down — speaks the Kafka wire protocol directly (no client lib) to
+# pull cluster metadata: brokers, active controller, topics, partitions, ISR.
+# From that Argus derives the classic health signals — under-replicated and
+# offline partitions, broker count, controller presence — sampled each cycle into
+# SQLite and alerted on transition into/out of "degraded". Assumes a PLAINTEXT
+# listener (the LAN target); no TLS/SASL.
+monitor_kafka_enable: true
+monitor_kafka_host: "{{ monitor_host_127 }}"
+monitor_kafka_port: 9092
+monitor_kafka_client_id: "argus"
+monitor_kafka_min_brokers: 1                       # degrade if fewer brokers than this are up
+# Traffic + queue-depth view: ListOffsets gives per-partition log-end offsets
+# (Σ delta/sec = message throughput); ListGroups + OffsetFetch give consumer-group
+# committed offsets (end - committed = lag, i.e. queues building up).
+monitor_kafka_track_traffic: true                  # show message throughput (msgs/sec)
+monitor_kafka_track_lag: true                      # show consumer-group lag (queue depth)
+monitor_kafka_lag_degrade: 0                        # total lag above this degrades; 0 = display only
+
+# Internet QoS — "Global URL trackers". The internet-group HTTP probes in
+# monitor_targets below double as a quality-of-service panel: their per-cycle
+# latency + up/down samples (already persisted to the samples table) are
+# aggregated into the Internet QoS drill-down — uptime %, avg/p95 latency,
+# jitter, and a merged latency trend per URL. A reachable-but-slow URL (latency
+# over degrade_ms) marks the whole panel "degraded" (amber) and posts a single
+# Mattermost degraded<->recovered transition (panel-level, not per URL). Add URLs
+# by appending more probes with group: "internet".
+monitor_internet_enable: true
+monitor_internet_group: "internet"     # probe group that feeds the QoS panel
+monitor_internet_poor_ms: 400          # latency above this is "poor" (amber on the page)
+monitor_internet_degrade_ms: 800       # reachable but slower than this => panel degraded
 
 # LAN hosts (kept as vars so the target list below stays readable).
 monitor_host_128: "192.168.88.128"              # the agent box (this host)
@@ -84,10 +133,12 @@ monitor_targets:
     url: "http://{{ monitor_host_128 }}:8123/"
     expect_status: [200, 401, 403]
 
+  # Ollama Cloud reachability — /api/version answers 200 without auth, so this is
+  # a clean up/down ping (the rich drill-down lives on its own authed thread).
   - name: ollama
-    group: ".127 LLM"
+    group: "ollama cloud"
     type: http
-    url: "http://{{ monitor_host_127 }}:11434/api/tags"
+    url: "https://ollama.com/api/version"
     expect_status: [200]
 
   - name: astonks-api
@@ -96,8 +147,40 @@ monitor_targets:
     url: "http://{{ monitor_host_127 }}:3000/"
     expect_status: [200]
 
+  - name: elasticsearch
+    group: ".127 stonks"
+    type: http
+    url: "http://{{ monitor_host_127 }}:9200/_cluster/health"
+    expect_status: [200]
+
+  - name: kafka
+    group: ".127 stonks"
+    type: tcp
+    host: "{{ monitor_host_127 }}"
+    port: 9092
+
   - name: mongodb
     group: ".142 database"
     type: tcp
     host: "{{ monitor_host_142 }}"
     port: 27017
+
+  # External reachability — confirms .128's uplink is healthy (any HTTP
+  # response = internet up; only DNS/connect failures register as down).
+  - name: google.com
+    group: "internet"
+    type: http
+    url: "https://google.com"
+    expect_status: [200, 301, 302, 401, 403, 404]
+
+  - name: api.massive.com
+    group: "internet"
+    type: http
+    url: "https://api.massive.com"
+    expect_status: [200, 301, 302, 401, 403, 404]
+
+  - name: starlink.com
+    group: "internet"
+    type: http
+    url: "https://starlink.com"
+    expect_status: [200, 301, 302, 401, 403, 404]

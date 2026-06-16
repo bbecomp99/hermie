@@ -26,11 +26,34 @@
   },
   "ollama": {
     "enable": {{ monitor_ollama_enable | bool | to_json }},
-    "host": {{ monitor_ollama_host | to_json }},
-    "port": {{ monitor_ollama_port }},
+    "base_url": {{ monitor_ollama_base_url | to_json }},
     "model": {{ monitor_ollama_model | to_json }},
     "canary_interval": {{ monitor_ollama_canary_interval }},
     "num_predict": {{ monitor_ollama_num_predict }}
+  },
+  "elastic": {
+    "enable": {{ monitor_elastic_enable | bool | to_json }},
+    "url": {{ monitor_elastic_url | to_json }},
+    "username": {{ monitor_elastic_username | to_json }},
+    "heap_pct": {{ monitor_elastic_heap_pct }},
+    "cpu_pct": {{ monitor_elastic_cpu_pct }},
+    "degrade_on_yellow": {{ monitor_elastic_degrade_on_yellow | bool | to_json }}
+  },
+  "kafka": {
+    "enable": {{ monitor_kafka_enable | bool | to_json }},
+    "host": {{ monitor_kafka_host | to_json }},
+    "port": {{ monitor_kafka_port }},
+    "client_id": {{ monitor_kafka_client_id | to_json }},
+    "min_brokers": {{ monitor_kafka_min_brokers }},
+    "track_traffic": {{ monitor_kafka_track_traffic | bool | to_json }},
+    "track_lag": {{ monitor_kafka_track_lag | bool | to_json }},
+    "lag_degrade": {{ monitor_kafka_lag_degrade }}
+  },
+  "internet": {
+    "enable": {{ monitor_internet_enable | bool | to_json }},
+    "group": {{ monitor_internet_group | to_json }},
+    "poor_ms": {{ monitor_internet_poor_ms }},
+    "degrade_ms": {{ monitor_internet_degrade_ms }}
   },
   "targets": {{ monitor_targets | to_nice_json(indent=4) | indent(2) }}
 }

@@ -1,10 +1,17 @@
-"""Tiny pure-stdlib Ollama API client for the Argus Ollama detail page.
+"""Tiny pure-stdlib Ollama Cloud (ollama.com) API client for the Argus detail page.
 
-Read-only diagnostics: queries Ollama's HTTP API (/api/version, /api/ps,
-/api/tags, /api/show) for a live snapshot, and runs a tiny fixed "canary"
-generation to measure throughput (tok/s). Ollama has NO passive metrics
-endpoint, so throughput can only be observed by actually generating — the
-canary does that cheaply (a handful of tokens against an already-loaded model).
+Read-only diagnostics against the HOSTED, serverless Ollama API: /api/version,
+/api/tags (the cloud model catalog), /api/show (the active model's config), plus
+a tiny fixed "canary" generation to measure round-trip throughput (tok/s). Ollama
+has NO passive metrics endpoint, so throughput can only be observed by actually
+generating — the canary does that cheaply.
+
+Cloud differs from a local server in two ways that shape this client:
+  * every call needs an `Authorization: Bearer <key>` header, and
+  * it is SERVERLESS — there is no resident model, VRAM, keep-alive, or /api/ps
+    (that endpoint returns "unauthorized"), and the canary's phase durations
+    (eval_duration/prompt_eval_duration) come back null, so throughput is derived
+    from total_duration (end-to-end) instead.
 
 No third-party deps; mirrors the style of mongo.py / hoststat.py.
 """
@@ -14,19 +21,25 @@ import urllib.request
 from datetime import datetime, timezone
 
 
-def _get(base, path, timeout):
-    req = urllib.request.Request(base + path,
-                                 headers={"User-Agent": "argus-ollama/1"})
+def _headers(api_key):
+    h = {"User-Agent": "argus-ollama/1"}
+    if api_key:
+        h["Authorization"] = f"Bearer {api_key}"
+    return h
+
+
+def _get(base, path, timeout, api_key=None):
+    req = urllib.request.Request(base + path, headers=_headers(api_key))
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return json.loads(resp.read().decode("utf-8", "replace"))
 
 
-def _post(base, path, payload, timeout):
+def _post(base, path, payload, timeout, api_key=None):
+    headers = _headers(api_key)
+    headers["Content-Type"] = "application/json"
     req = urllib.request.Request(
         base + path, data=json.dumps(payload).encode(),
-        headers={"Content-Type": "application/json",
-                 "User-Agent": "argus-ollama/1"},
-        method="POST")
+        headers=headers, method="POST")
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return json.loads(resp.read().decode("utf-8", "replace"))
 
@@ -34,18 +47,6 @@ def _post(base, path, payload, timeout):
 # ---------------------------------------------------------------------------
 # Response shaping (drop the megabyte-sized tokenizer arrays /api/show returns)
 # ---------------------------------------------------------------------------
-
-
-def _running(m):
-    return {
-        "name": m.get("name"),
-        "model": m.get("model"),
-        "size": m.get("size"),
-        "size_vram": m.get("size_vram"),
-        "context_length": m.get("context_length"),
-        "expires_at": m.get("expires_at"),
-        "details": m.get("details", {}) or {},
-    }
 
 
 def _installed(m):
@@ -57,7 +58,7 @@ def _installed(m):
         "family": d.get("family"),
         "parameter_size": d.get("parameter_size"),
         "quantization_level": d.get("quantization_level"),
-        "context_length": d.get("context_length"),
+        "context_length": m.get("context_length"),
         "capabilities": m.get("capabilities", []) or [],
     }
 
@@ -79,8 +80,8 @@ def _parse_params(text):
     return params
 
 
-def _show(base, model, timeout):
-    d = _post(base, "/api/show", {"model": model}, timeout)
+def _show(base, model, timeout, api_key):
+    d = _post(base, "/api/show", {"model": model}, timeout, api_key)
     return {
         "parameters": _parse_params(d.get("parameters")),
         "details": d.get("details", {}) or {},
@@ -94,28 +95,26 @@ def _show(base, model, timeout):
 # ---------------------------------------------------------------------------
 
 
-def health(host, port, timeout=8):
-    """Live snapshot: version, running models, installed models, and the active
-    model's config/architecture. Shape mirrors mongo.health() (ok/host/fetched
-    + error on failure)."""
-    base = f"http://{host}:{port}"
-    out = {"ok": False, "host": f"{host}:{port}",
+def health(base, api_key, model, timeout=8):
+    """Live snapshot of Ollama Cloud: version, the model catalog, and the active
+    model's config/architecture. Shape mirrors the prior local client (ok/host/
+    fetched + error on failure) so the detail page stays compatible. `running` is
+    always [] — cloud is serverless, nothing is "resident"."""
+    base = base.rstrip("/")
+    out = {"ok": False, "host": base.split("://")[-1], "cloud": True,
            "fetched": datetime.now(timezone.utc).isoformat()}
     try:
-        out["version"] = _get(base, "/api/version", timeout).get("version")
-        ps = _get(base, "/api/ps", timeout)
-        running = ps.get("models", []) or []
-        out["running"] = [_running(m) for m in running]
-        tags = _get(base, "/api/tags", timeout)
+        out["version"] = _get(base, "/api/version", timeout, api_key).get("version")
+        out["running"] = []          # serverless — no resident models / VRAM
+        tags = _get(base, "/api/tags", timeout, api_key)
         installed = tags.get("models", []) or []
         out["models"] = [_installed(m) for m in installed]
-        # Show config for the loaded model (fall back to the first installed).
-        focus = (running[0].get("model") if running
-                 else (installed[0].get("model") if installed else None))
+        # The "active" model is the configured one (cloud loads nothing eagerly).
+        focus = model or (installed[0].get("model") if installed else None)
         out["focus"] = focus
         if focus:
             try:
-                out["show"] = _show(base, focus, timeout)
+                out["show"] = _show(base, focus, timeout, api_key)
             except Exception:  # noqa: BLE001 - show is best-effort detail
                 out["show"] = None
         out["ok"] = True
@@ -127,61 +126,47 @@ def health(host, port, timeout=8):
 
 
 # ---------------------------------------------------------------------------
-# Throughput canary (the only call that performs inference)
+# Throughput canary (the only call that performs inference — and is billed)
 # ---------------------------------------------------------------------------
 
 
-def loaded(host, port, timeout=8):
-    """Return the model currently RESIDENT in memory as {model, context_length},
-    or None. The canary uses this so it only ever probes an already-loaded model
-    — it must never be the thing that triggers a load."""
-    try:
-        ps = _get(f"http://{host}:{port}", "/api/ps", timeout)
-    except Exception:  # noqa: BLE001
-        return None
-    models = ps.get("models", []) or []
-    if not models:
-        return None
-    m = models[0]
-    return {"model": m.get("model") or m.get("name"),
-            "context_length": m.get("context_length")}
+def canary(base, api_key, model, num_predict=16, timeout=120):
+    """Run a tiny fixed generation against the configured cloud model and return
+    throughput metrics, or None. Each call is a real BILLED generation, so the
+    caller keeps it tiny + infrequent.
 
-
-def canary(host, port, model, num_ctx=None, num_predict=16, keep_alive=-1,
-           timeout=120):
-    """Run a tiny fixed generation and return throughput metrics, or None.
-
-    SAFETY (this model is shared with the live agent): we pass num_ctx matching
-    the already-loaded runner and keep_alive=-1, so Ollama reuses the exact
-    resident instance — it never reloads, resizes, or shortens the keep-alive of
-    the production model. Omitting num_ctx/keep_alive would load a SECOND default
-    (4096, 5-min) instance and evict the agent's — so both are always sent.
-    Caller must only pass a model that is currently loaded (see loaded())."""
-    base = f"http://{host}:{port}"
-    options = {"num_predict": num_predict, "temperature": 0}
-    if num_ctx:
-        options["num_ctx"] = num_ctx          # match the runner → no reload
+    Cloud returns null phase durations (eval_duration/prompt_eval_duration), so
+    eval_tps falls back to an end-to-end figure from total_duration (which also
+    folds in queue + network — it's a round-trip throughput, not pure decode)."""
+    base = base.rstrip("/")
     payload = {
         "model": model,
         "prompt": "In one short sentence, what is the Parthenon?",
         "stream": False,
-        "keep_alive": keep_alive,             # -1 = preserve the existing pin
-        "options": options,
+        "options": {"num_predict": num_predict, "temperature": 0},
     }
     try:
-        d = _post(base, "/api/generate", payload, timeout)
+        d = _post(base, "/api/generate", payload, timeout, api_key)
     except Exception as exc:  # noqa: BLE001 - any failure → no sample this cycle
         print(f"[argus] ollama canary error: {type(exc).__name__}: {exc}",
               flush=True)
         return None
-    ec, ed = d.get("eval_count") or 0, d.get("eval_duration") or 0
-    pc, pd = d.get("prompt_eval_count") or 0, d.get("prompt_eval_duration") or 0
+    ec, ed = d.get("eval_count") or 0, d.get("eval_duration")
+    pc, pd = d.get("prompt_eval_count") or 0, d.get("prompt_eval_duration")
+    td, ld = d.get("total_duration") or 0, d.get("load_duration")
+    # Prefer the true decode duration; fall back to end-to-end when cloud omits it.
+    if ed:
+        eval_tps = round(ec / (ed / 1e9), 1)
+    elif td:
+        eval_tps = round(ec / (td / 1e9), 1)
+    else:
+        eval_tps = None
     return {
         "model": model,
         "eval_count": ec,
         "prompt_eval_count": pc,
-        "eval_tps": round(ec / (ed / 1e9), 1) if ed else None,
+        "eval_tps": eval_tps,
         "prompt_tps": round(pc / (pd / 1e9), 1) if pd else None,
-        "load_ms": round((d.get("load_duration") or 0) / 1e6, 1),
-        "total_ms": round((d.get("total_duration") or 0) / 1e6, 1),
+        "load_ms": round(ld / 1e6, 1) if ld else None,
+        "total_ms": round(td / 1e6, 1) if td else None,
     }
