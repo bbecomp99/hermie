@@ -3,7 +3,7 @@
 Running notes for the `hermie` repo so I can catch myself up across sessions.
 Newest context at the top of each section. **No secrets in this file.**
 
-## 2026-06-15 — Argus: Kafka traffic + consumer-lag (queue depth) on the drill-down
+## 2026-06-15 — Argus: Kafka traffic + consumer-lag (queue depth) on the drill-down — DEPLOYED
 - The Kafka page only read **metadata** (brokers/ISR). Added two things the user
   asked for: **message throughput** and **queues building up** (consumer lag).
 - **`kafka.py`** — three new pre-flexible wire requests (same hand-rolled style,
@@ -48,7 +48,15 @@ Newest context at the top of each section. **No secrets in this file.**
   `stonks-distributor` / `agentic-distributor` both **lag 0** (caught up).
   Wire round-trips, store migration (old→new schema), eval delta, and a 2-sample
   throughput delta all unit/smoke-tested green; full server boots, page 200,
-  endpoints correct. ⚠️ Not yet deployed — same `--tags monitoring` (pinky sudo).
+  endpoints correct.
+- ✅ **DEPLOYED to .128 + verified live** (`--tags monitoring --become-password-file`,
+  pw from `.env` PASS, colon-delimited so extract the value after `PASS:` into a
+  600 temp file). `failed=0`, image rebuilt via both handlers. `/api/kafka` →
+  ok:true, broker .127:9092, traffic total_end_offset 42.95M, 2 groups lag 0;
+  `/api/kafka/history` returns **721 rows** (the `_migrate()` ALTER worked — old
+  rows survived, new samples carry total_lag/consumer_groups/msgs_per_sec);
+  kafka.html 200. msgs_per_sec shows None while the ticks topic is idle (offset
+  stable) — it'll populate once producers resume.
 
 ## 2026-06-14 — Argus: Internet QoS drill-down (merged URL trackers) — DEPLOYED
 - **Deployed to .128 + verified live** (`ansible-playbook playbook.yml --tags
