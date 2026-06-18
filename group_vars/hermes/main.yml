@@ -11,19 +11,21 @@ hermes_version: "a6e47314f98cccb09f302ad649d8bec30e4b4a2d"  # pinned to the runn
 # new). Switched off MLX (:8080) because mlx_lm.server cannot emit structured
 # tool_calls (tool_turns=0); Ollama returns real tool calls.
 #
-# `default` is the cloud model `qwen3-next:80b` (80B MoE) — a clean instruct/
-# tool-calling model that emits structured tool_calls over the OpenAI /v1 path and
-# has a 128K+ window, clearing the 64K floor Hermes Agent enforces (no Modelfile/
-# num_ctx needed on cloud — the served context is the model's full window).
-# Replaced the local `lfm2.5:8b-hermes` when local Ollama was retired off the 16GB
-# Mac. (History: tried cloud `gpt-oss:20b` first, but it's a reasoning/harmony
-# model — over /v1 ollama.com returns empty content or a raw `…assistantfinal…`
-# blob instead of clean content/tool_calls, so the agent got "Empty response from
-# model". qwen3-next returns proper tool_calls. Local path baked num_ctx 65536 via
-# a Modelfile because the OpenAI API can't pass num_ctx; llama3.2:3b-hermes was too
-# weak at tool-choice; Qwen2.5-7B capped at 32K.)
+# `default` is the cloud model `devstral-2:123b` (Mistral's agentic 123B) — emits
+# clean structured tool_calls over the OpenAI /v1 path and clears the 64K floor
+# Hermes Agent enforces (cloud serves the model's full window — no Modelfile/num_ctx
+# needed). Replaced `qwen3-next:80b` after ollama.com RETIRED it from the cloud
+# catalog (2026-06) — the old model 404s now. DeepSeek (v3.x/v4) was requested but
+# every DeepSeek variant is subscription-gated on this account (403 "requires a
+# subscription"); same for qwen3.5:397b / glm-5.2 / kimi / mistral-large-3. Of the
+# free-tier models that DO return real tool_calls (devstral-2:123b, minimax-m3,
+# qwen3-coder-next, gpt-oss:120b) devstral was chosen — and it's the same model the
+# Argus canary uses. (History: tried cloud `gpt-oss:20b` first — reasoning/harmony,
+# returns empty content / `…assistantfinal…` blobs over /v1 → "Empty response from
+# model"; the 120b variant does emit tool_calls though. Earlier local path: lfm2.5/
+# llama3.2:3b too weak at tool-choice, Qwen2.5-7B capped at 32K.)
 # MLX still runs on :8080 for the separately-managed ai-serve/stonks coding model.
-hermes_model_default: "qwen3-next:80b"
+hermes_model_default: "devstral-2:123b"
 hermes_model_provider: "custom"
 hermes_model_base_url: "https://ollama.com/v1"
 hermes_model_api_key: "{{ ollama_api_key }}"   # from group_vars/hermes/vault.yml

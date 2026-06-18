@@ -161,12 +161,18 @@ def canary(base, api_key, model, num_predict=16, timeout=120):
         eval_tps = round(ec / (td / 1e9), 1)
     else:
         eval_tps = None
+    # Round-trip (total) throughput. Cloud omits every per-phase clock —
+    # prompt_eval_duration is null — so prefill speed can't be isolated. Instead
+    # report the combined end-to-end rate: ALL tokens processed (prompt + generated)
+    # over total_duration. Carried in the prompt_tps field/column, which has only
+    # ever been null on cloud (no real prefill data is being displaced).
+    roundtrip_tps = round((pc + ec) / (td / 1e9), 1) if td else None
     return {
         "model": model,
         "eval_count": ec,
         "prompt_eval_count": pc,
         "eval_tps": eval_tps,
-        "prompt_tps": round(pc / (pd / 1e9), 1) if pd else None,
+        "prompt_tps": roundtrip_tps,
         "load_ms": round(ld / 1e6, 1) if ld else None,
         "total_ms": round(td / 1e6, 1) if td else None,
     }

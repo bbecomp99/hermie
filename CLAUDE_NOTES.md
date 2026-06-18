@@ -3,6 +3,41 @@
 Running notes for the `hermie` repo so I can catch myself up across sessions.
 Newest context at the top of each section. **No secrets in this file.**
 
+## 2026-06-18 — Ollama Cloud catalog rotation broke the canary + agent — FIXED & DEPLOYED
+- **Symptom:** the Argus Ollama drill-down stopped recording throughput (last
+  canary 2026-06-16 06:52 UTC, trend went empty). Up/down `/api/version` ping was
+  still 200 (no auth), so it looked half-alive.
+- **Root cause:** ollama.com **rotated its model catalog and retired
+  `qwen3-next:80b`** — it's gone from `/api/tags` (new lineup: glm-5.2,
+  deepseek-v4-pro/flash, qwen3.5:397b, qwen3-coder-next, kimi-k2.7, minimax-m3,
+  devstral-2:123b, …). The canary kept generating against the dead model → 404
+  every cycle. **Same model broke the live agent** (`hermes_model_default` was
+  also `qwen3-next:80b` → model-not-found).
+- **Canary fix** (`roles/monitoring/`): `monitor_ollama_model` →
+  **`devstral-2:123b`**. Verified live: focus + canary on devstral, output 28.0 /
+  round-trip 54.3 tok/s. Deployed `--tags monitoring`.
+- **PROMPT THROUGHPUT was dead since the cloud switch** (user noticed): cloud is
+  serverless and returns **every phase clock null** — `prompt_eval_duration` too
+  (confirmed live on devstral: only `total_duration` comes back). So prefill speed
+  **can't be isolated**. Per user's choice, **repurposed the panel to round-trip
+  total throughput** = `(prompt_eval_count + eval_count) / total_duration` —
+  carried in the existing `prompt_tps` field/column (always null on cloud, so no
+  schema migration). `ollama.html` heroes relabeled: **"Output throughput"**
+  (eval_tps) + **"Round-trip throughput"** (prompt_tps); trend legend output/
+  round-trip.
+- **Agent fix** (`group_vars/hermes/main.yml`): user asked for "latest DeepSeek" —
+  but **ALL DeepSeek variants are subscription-gated** on this account (403 "this
+  model requires a subscription, upgrade for access"); same 403 for qwen3.5:397b,
+  glm-5.2, kimi-k2.6, mistral-large-3:675b. Free-tier models that **do** emit real
+  `tool_calls` over `/v1` (verified with a get_weather tool): **devstral-2:123b,
+  minimax-m3, qwen3-coder-next, gpt-oss:120b** (note the 120b works even though the
+  old gpt-oss:20b failed). User chose **devstral-2:123b** (same as the canary).
+  Deployed `--tags model` + `systemctl --user restart hermes-gateway`; gateway
+  active, reconnected to Mattermost (@hermie) + HA clean, config.yaml
+  `default: devstral-2:123b`.
+- **To use DeepSeek later:** upgrade at ollama.com/upgrade, then repoint
+  `hermes_model_default` to `deepseek-v4-pro` and re-verify tool_calls.
+
 ## 2026-06-15 — Argus: Kafka traffic + consumer-lag (queue depth) on the drill-down — DEPLOYED
 - The Kafka page only read **metadata** (brokers/ISR). Added two things the user
   asked for: **message throughput** and **queues building up** (consumer lag).
