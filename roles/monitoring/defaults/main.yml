@@ -43,8 +43,10 @@ monitor_ssh_known_hosts_src: "{{ ansible_env.HOME }}/.ssh/known_hosts"
 monitor_ollama_enable: true
 monitor_ollama_base_url: "https://ollama.com"    # Ollama Cloud endpoint
 monitor_ollama_api_key: "{{ ollama_api_key }}"   # from group_vars/hermes/vault.yml
-monitor_ollama_model: "qwen3-next:80b"           # model to canary (cloud has no
-                                                 # resident model to auto-detect)
+monitor_ollama_model: "devstral-2:123b"          # model to canary (cloud has no
+                                                 # resident model to auto-detect;
+                                                 # qwen3-next:80b was retired from the
+                                                 # cloud catalog 2026-06)
 monitor_ollama_canary_interval: 900              # seconds between canaries (15 min)
 monitor_ollama_num_predict: 16                   # tokens generated per canary (tiny)
 
