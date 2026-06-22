@@ -3,6 +3,35 @@
 Running notes for the `hermie` repo so I can catch myself up across sessions.
 Newest context at the top of each section. **No secrets in this file.**
 
+## 2026-06-22 — Argus: rich Mattermost alerts (color + metric fields + sparkline) — DEPLOYED
+- User wanted more detail / a graph in the Argus alerts that post to Mattermost.
+  Kept the **no-deps ethos** — no matplotlib / no image upload. The "graph" is a
+  **Unicode sparkline** (`▁▂▃▄▅▆▇█`) built from the existing SQLite history, wrapped
+  in a **Mattermost message attachment** (Slack-compatible `props.attachments`:
+  colour bar + key/value fields).
+- **`app.py`** helpers: `_sparkline(values,width=30)` (None-skipping, flat→`▁`,
+  '' when <2 pts), `_field()`, `_spark_field(label,values,unit,fmt)` (sparkline +
+  "now X · range lo–hi"), `_post(mm,text,color,fields)` (builds the attachment when
+  `mm.rich`, else falls back to the plain one-liner). `post_mattermost()` now takes
+  optional `attachments`. Colours: `C_DOWN`#d24b4e / `C_UP`#3db887 / `C_WARN`#e0a800.
+- Each alert type enriched: **up/down** (`alert()`, +store) → latency sparkline +
+  2h uptime%; **Mongo** (`post_mongo_perf`, +metrics/store) → write/read/disk/queue/
+  conns + write-latency sparkline; **ES** (`_es_fields`) → cluster/heap/cpu/unassigned
+  /search-qps + heap% sparkline; **Kafka** (`_kafka_fields`) → brokers/partitions/
+  under-repl/offline/groups/lag/throughput + lag sparkline (falls back to throughput
+  if lag flat); **Internet QoS** (`_internet_fields`) → per-slow-URL latency + worst-URL
+  latency sparkline (loop now collects `slow_pairs`). `post_perf()` stays generic,
+  takes prebuilt `fields`. `heartbeat()` → up/down counts + down/degraded lists.
+- Config: **`monitor_mm_rich`** (default true) → config.json `mattermost.rich` →
+  `mm.setdefault("rich",True)`. Set false to revert to plain text.
+- ✅ Logic unit-tested locally (sparkline/fields/fallback). ✅ Deployed
+  `--tags monitoring` (rebuild+restart, failed=0), config.json shows `rich:true`.
+  ✅ **Verified live in Mattermost**: a TEST post via the real `app._post` rendered
+  the red attachment with all fields + `▁▁▂▃▄▅▆▇█` range 58–92% (then deleted the
+  test posts). NOTE: a couple of internet alerts at ~11:24Z had no attachment —
+  they fired from the OLD container just before the 11:41Z restart, not a bug.
+  Real alerts only post on a state **transition**.
+
 ## 2026-06-18 — Ollama Cloud catalog rotation broke the canary + agent — FIXED & DEPLOYED
 - **Symptom:** the Argus Ollama drill-down stopped recording throughput (last
   canary 2026-06-16 06:52 UTC, trend went empty). Up/down `/api/version` ping was

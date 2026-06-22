@@ -5,7 +5,8 @@
   "mattermost": {
     "enable": {{ monitor_mm_enable | bool | to_json }},
     "url": {{ monitor_mm_url | to_json }},
-    "channel_id": {{ monitor_mm_channel_id | to_json }}
+    "channel_id": {{ monitor_mm_channel_id | to_json }},
+    "rich": {{ monitor_mm_rich | bool | to_json }}
   },
   "mongo_perf": {
     "enable": {{ monitor_mongo_perf_enable | bool | to_json }},

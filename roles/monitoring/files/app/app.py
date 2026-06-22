@@ -47,6 +47,7 @@ def load_config():
     mm.setdefault("enable", False)
     mm.setdefault("url", "")
     mm.setdefault("channel_id", "")
+    mm.setdefault("rich", True)   # colour-barred attachments + metric fields + sparkline
     # The token is injected via env, never persisted in the config file.
     mm["token"] = os.environ.get("MM_TOKEN", "")
     if not mm["token"] or not mm["url"] or not mm["channel_id"]:
@@ -348,9 +349,50 @@ def internet_snapshot(state, store, int_cfg, hours=1):
 # ---------------------------------------------------------------------------
 
 
-def post_mattermost(mm, text):
+# Attachment colour bar (Slack-compatible; Mattermost renders props.attachments).
+C_DOWN = "#d24b4e"   # red    — down / degraded
+C_UP = "#3db887"     # green  — recovered / all clear
+C_WARN = "#e0a800"   # amber  — heartbeat with outstanding issues
+SPARK = "▁▂▃▄▅▆▇█"   # pure-stdlib "graph": no matplotlib, keeps Argus dep-free
+
+
+def _sparkline(values, width=30):
+    """A Unicode trend line from a numeric series (None entries skipped). Returns
+    '' when there are <2 real points so callers can omit the field entirely."""
+    vals = [v for v in values if isinstance(v, (int, float))][-width:]
+    if len(vals) < 2:
+        return ""
+    lo, hi = min(vals), max(vals)
+    span = hi - lo
+    if span == 0:
+        return SPARK[0] * len(vals)
+    n = len(SPARK) - 1
+    return "".join(SPARK[int((v - lo) / span * n)] for v in vals)
+
+
+def _field(title, value, short=True):
+    return {"title": title, "value": value, "short": short}
+
+
+def _spark_field(label, values, unit="", fmt="{:.0f}"):
+    """A full-width attachment field: a sparkline + the current value and lo→hi
+    range of the series. None when there isn't enough history to draw."""
+    spark = _sparkline(values)
+    if not spark:
+        return None
+    vals = [v for v in values if isinstance(v, (int, float))]
+    cur = fmt.format(vals[-1]) + unit
+    rng = f"{fmt.format(min(vals))}–{fmt.format(max(vals))}{unit}"
+    return _field(f"{label} · last {len(vals)} (now {cur})",
+                  f"`{spark}`  range {rng}", short=False)
+
+
+def post_mattermost(mm, text, attachments=None):
     url = mm["url"].rstrip("/") + "/api/v4/posts"
-    payload = json.dumps({"channel_id": mm["channel_id"], "message": text}).encode()
+    body = {"channel_id": mm["channel_id"], "message": text}
+    if attachments:
+        body["props"] = {"attachments": attachments}
+    payload = json.dumps(body).encode()
     req = urllib.request.Request(
         url,
         data=payload,
@@ -368,14 +410,37 @@ def post_mattermost(mm, text):
         return False
 
 
-def alert(mm, target, new_status, detail):
+def _post(mm, text, color=None, fields=None):
+    """Post a headline plus (when rich alerts are enabled) a colour-barred
+    attachment carrying metric fields and a sparkline. Falls back to the plain
+    one-liner when mm.rich is off, so the alert is never lost."""
+    attachments = None
+    if mm.get("rich", True) and fields:
+        attachments = [{"color": color or C_DOWN, "mrkdwn_in": ["text", "fields"],
+                        "fields": fields, "footer": "Argus · the all-seeing watch"}]
+    post_mattermost(mm, text, attachments)
+
+
+def alert(mm, target, new_status, detail, store=None):
     if not mm.get("enable"):
         return
-    if new_status == "down":
+    down = new_status == "down"
+    if down:
         text = f"👁 **Argus** · :red_circle: **{target}** is DOWN — {detail}"
     else:
         text = f"👁 **Argus** · :large_green_circle: **{target}** RECOVERED — {detail}"
-    post_mattermost(mm, text)
+    fields = []
+    if store:
+        hist = store.history(target, hours=2, limit=240)
+        sf = _spark_field("Latency", [h["latency_ms"] for h in hist], unit="ms")
+        if sf:
+            fields.append(sf)
+        statuses = [h["status"] for h in hist]
+        if statuses:
+            up = sum(1 for s in statuses if s == "up")
+            fields.append(_field("Uptime (2h)",
+                                 f"{100 * up / len(statuses):.0f}% ({up}/{len(statuses)} probes)"))
+    _post(mm, text, C_UP if not down else C_DOWN, fields)
 
 
 def heartbeat(mm, snap):
@@ -384,13 +449,23 @@ def heartbeat(mm, snap):
     if not mm.get("enable"):
         return
     s = snap["summary"]
+    targets = snap.get("targets", [])
     if s["down"] == 0:
         text = f"👁 **Argus** · :white_check_mark: **All clear** — {s['up']}/{s['total']} services up"
+        color = C_UP
     else:
-        downs = ", ".join(t["name"] for t in snap["targets"] if t["status"] == "down")
+        downs = ", ".join(t["name"] for t in targets if t["status"] == "down")
         text = (f"👁 **Argus** · :yellow_heart: **Heartbeat** — {s['up']}/{s['total']} up, "
                 f"{s['down']} DOWN: {downs}")
-    post_mattermost(mm, text)
+        color = C_WARN
+    fields = [_field("Services up", f"{s['up']}/{s['total']}")]
+    downs = [t["name"] for t in targets if t["status"] == "down"]
+    if downs:
+        fields.append(_field("Down", ", ".join(downs), short=False))
+    degraded = [t["name"] for t in targets if t.get("status") == "degraded"]
+    if degraded:
+        fields.append(_field("Degraded", ", ".join(degraded), short=False))
+    _post(mm, text, color, fields)
 
 
 # ---------------------------------------------------------------------------
@@ -439,7 +514,7 @@ def eval_mongo_perf(prev, cur, thr):
     return bool(reasons), reasons, m
 
 
-def post_mongo_perf(mm, degraded, reasons):
+def post_mongo_perf(mm, degraded, reasons, metrics=None, store=None):
     if not mm.get("enable"):
         return
     if degraded:
@@ -447,7 +522,24 @@ def post_mongo_perf(mm, degraded, reasons):
     else:
         text = ("👁 **Argus** · :large_green_circle: **MongoDB recovered** — "
                 "latency / storage queue back to normal")
-    post_mattermost(mm, text)
+    fields = []
+    if metrics:
+        for title, key in (("Write latency", "write_ms"), ("Read latency", "read_ms"),
+                           ("Disk/page", "disk_ms")):
+            v = metrics.get(key)
+            if v is not None:
+                fields.append(_field(title, f"{v:.1f}ms"))
+        if metrics.get("queue") is not None:
+            fields.append(_field("Storage queue", str(metrics["queue"])))
+        if metrics.get("conns") is not None:
+            fields.append(_field("Connections", str(metrics["conns"])))
+    if store:
+        sf = _spark_field("Write latency",
+                          [h["write_ms"] for h in store.mongo_history(hours=3)],
+                          unit="ms", fmt="{:.1f}")
+        if sf:
+            fields.append(sf)
+    _post(mm, text, C_DOWN if degraded else C_UP, fields)
 
 
 def eval_elastic_perf(prev, cur, thr, dt):
@@ -514,8 +606,10 @@ def eval_kafka_perf(prev, cur, thr, dt):
     return bool(reasons), reasons, m
 
 
-def post_perf(mm, name, degraded, reasons):
-    """Mattermost transition alert for a service's degraded<->healthy flip."""
+def post_perf(mm, name, degraded, reasons, fields=None):
+    """Mattermost transition alert for a service's degraded<->healthy flip. The
+    caller passes service-specific metric/sparkline `fields` (see _es_fields /
+    _kafka_fields / _internet_fields)."""
     if not mm.get("enable"):
         return
     if degraded:
@@ -523,7 +617,67 @@ def post_perf(mm, name, degraded, reasons):
     else:
         text = (f"👁 **Argus** · :large_green_circle: **{name} recovered** — "
                 "back to normal")
-    post_mattermost(mm, text)
+    _post(mm, text, C_DOWN if degraded else C_UP, fields)
+
+
+def _es_fields(metrics, store):
+    """Metric + heap-trend fields for an Elasticsearch degraded/recovered alert."""
+    fields = []
+    if metrics:
+        if metrics.get("status"):
+            fields.append(_field("Cluster", str(metrics["status"]).upper()))
+        for title, key in (("Heap", "heap_pct"), ("CPU", "cpu_pct")):
+            v = metrics.get(key)
+            if v is not None:
+                fields.append(_field(title, f"{v:.0f}%"))
+        if metrics.get("unassigned") is not None:
+            fields.append(_field("Unassigned shards", str(metrics["unassigned"])))
+        if metrics.get("search_qps") is not None:
+            fields.append(_field("Search q/s", f"{metrics['search_qps']:.1f}"))
+    if store:
+        sf = _spark_field("Heap %",
+                          [h["heap_pct"] for h in store.elastic_history(hours=3)], unit="%")
+        if sf:
+            fields.append(sf)
+    return fields
+
+
+def _kafka_fields(metrics, store):
+    """Metric + lag/throughput-trend fields for a Kafka degraded/recovered alert."""
+    fields = []
+    if metrics:
+        for title, key in (("Brokers", "brokers"), ("Partitions", "partitions"),
+                           ("Under-replicated", "under_replicated"),
+                           ("Offline", "offline"), ("Consumer groups", "consumer_groups")):
+            v = metrics.get(key)
+            if v is not None:
+                fields.append(_field(title, str(v)))
+        if metrics.get("total_lag") is not None:
+            fields.append(_field("Consumer lag", f"{metrics['total_lag']:,}"))
+        if metrics.get("msgs_per_sec") is not None:
+            fields.append(_field("Throughput", f"{metrics['msgs_per_sec']:.1f} msg/s"))
+    if store:
+        hist = store.kafka_history(hours=3)
+        sf = _spark_field("Consumer lag", [h["total_lag"] for h in hist])
+        if sf is None:  # lag flat/empty → show throughput instead
+            sf = _spark_field("Throughput", [h["msgs_per_sec"] for h in hist],
+                              unit=" msg/s", fmt="{:.1f}")
+        if sf:
+            fields.append(sf)
+    return fields
+
+
+def _internet_fields(slow_pairs, store):
+    """Per-URL latency fields + a latency sparkline for the worst URL."""
+    fields = [_field(nm, f"{lat}ms") for nm, lat in slow_pairs]
+    if store and slow_pairs:
+        worst = max(slow_pairs, key=lambda p: p[1])[0]
+        sf = _spark_field(f"{worst} latency",
+                          [h["latency_ms"] for h in store.history(worst, hours=2, limit=240)],
+                          unit="ms")
+        if sf:
+            fields.append(sf)
+    return fields
 
 
 def monitor_loop(cfg, state, store=None, host_latest=None,
@@ -568,7 +722,7 @@ def monitor_loop(cfg, state, store=None, host_latest=None,
             print(f"[argus] {tag} {name} ({latency}ms) {detail}", flush=True)
             cycle_rows.append((name, new, latency))
             if transitioned:
-                alert(mm, name, new, detail)
+                alert(mm, name, new, detail, store)
                 if store:
                     store.insert_event(name, "transition", f"{new}: {detail}")
         if store and cycle_rows:
@@ -579,6 +733,7 @@ def monitor_loop(cfg, state, store=None, host_latest=None,
         # URL, so a flapping endpoint can't spam the channel.
         if it["enable"] and internet_names:
             slow = []
+            slow_pairs = []
             for nm, new, latency in cycle_rows:
                 if nm not in internet_names:
                     continue
@@ -588,9 +743,11 @@ def monitor_loop(cfg, state, store=None, host_latest=None,
                     f"latency {latency}ms (>{internet_degrade_ms}ms)" if deg else "")
                 if deg:
                     slow.append(f"{nm} {latency}ms")
+                    slow_pairs.append((nm, latency))
             if bool(slow) != internet_degraded:
                 internet_degraded = bool(slow)
-                post_perf(mm, "Internet QoS", internet_degraded, slow)
+                post_perf(mm, "Internet QoS", internet_degraded, slow,
+                          _internet_fields(slow_pairs, store))
                 if store:
                     store.insert_event(
                         "internet", "perf",
@@ -609,7 +766,7 @@ def monitor_loop(cfg, state, store=None, host_latest=None,
                     store.insert_mongo_perf(metrics)
                 if degraded != mongo_degraded:
                     mongo_degraded = degraded
-                    post_mongo_perf(mm, degraded, reasons)
+                    post_mongo_perf(mm, degraded, reasons, metrics, store)
                     if store:
                         store.insert_event(
                             "mongodb", "perf",
@@ -635,7 +792,8 @@ def monitor_loop(cfg, state, store=None, host_latest=None,
                     store.insert_elastic_perf(metrics)
                 if degraded != es_degraded:
                     es_degraded = degraded
-                    post_perf(mm, "Elasticsearch", degraded, reasons)
+                    post_perf(mm, "Elasticsearch", degraded, reasons,
+                              _es_fields(metrics, store))
                     if store:
                         store.insert_event(
                             "elasticsearch", "perf",
@@ -666,7 +824,8 @@ def monitor_loop(cfg, state, store=None, host_latest=None,
                     store.insert_kafka_perf(metrics)
                 if degraded != kafka_degraded:
                     kafka_degraded = degraded
-                    post_perf(mm, "Kafka", degraded, reasons)
+                    post_perf(mm, "Kafka", degraded, reasons,
+                              _kafka_fields(metrics, store))
                     if store:
                         store.insert_event(
                             "kafka", "perf",
