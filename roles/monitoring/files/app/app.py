@@ -21,6 +21,7 @@ from collections import deque
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+import chart
 import elastic
 import hoststat
 import kafka
@@ -355,38 +356,71 @@ def internet_snapshot(state, store, int_cfg, hours=1):
 C_DOWN = "#d24b4e"   # red    — down / degraded
 C_UP = "#3db887"     # green  — recovered / all clear
 C_WARN = "#e0a800"   # amber  — heartbeat with outstanding issues
-SPARK = "▁▂▃▄▅▆▇█"   # pure-stdlib "graph": no matplotlib, keeps Argus dep-free
-
-
-def _sparkline(values, width=30):
-    """A Unicode trend line from a numeric series (None entries skipped). Returns
-    '' when there are <2 real points so callers can omit the field entirely."""
-    vals = [v for v in values if isinstance(v, (int, float))][-width:]
-    if len(vals) < 2:
-        return ""
-    lo, hi = min(vals), max(vals)
-    span = hi - lo
-    if span == 0:
-        return SPARK[0] * len(vals)
-    n = len(SPARK) - 1
-    return "".join(SPARK[int((v - lo) / span * n)] for v in vals)
 
 
 def _field(title, value, short=True):
     return {"title": title, "value": value, "short": short}
 
 
-def _spark_field(label, values, unit="", fmt="{:.0f}"):
-    """A full-width attachment field: a sparkline + the current value and lo→hi
-    range of the series. None when there isn't enough history to draw."""
-    spark = _sparkline(values)
-    if not spark:
+def _hex_rgb(h):
+    h = (h or "").lstrip("#")
+    return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4)) if len(h) == 6 else (96, 165, 250)
+
+
+def _trend_caption(label, values, unit="", fmt="{:.0f}"):
+    """Short numeric caption for a trend (the rendered chart carries the shape):
+    current value + lo→hi range. None when there's nothing to summarise."""
+    vals = [v for v in values if isinstance(v, (int, float))]
+    if not vals:
+        return None
+    rng = f"{fmt.format(min(vals))}–{fmt.format(max(vals))}{unit}"
+    return _field(f"{label} · last {len(vals)}",
+                  f"now {fmt.format(vals[-1])}{unit} · range {rng}", short=False)
+
+
+def _upload_png(mm, filename, data):
+    """Upload a PNG to the alert channel via the Mattermost files API → file id."""
+    boundary = "----argus" + os.urandom(8).hex()
+    body = bytearray()
+
+    def part(disp, content, ctype=None):
+        body.extend(("--" + boundary + "\r\n").encode())
+        body.extend(("Content-Disposition: form-data; " + disp + "\r\n").encode())
+        if ctype:
+            body.extend(("Content-Type: " + ctype + "\r\n").encode())
+        body.extend(b"\r\n")
+        body.extend(content)
+        body.extend(b"\r\n")
+
+    part('name="channel_id"', mm["channel_id"].encode())
+    part(f'name="files"; filename="{filename}"', data, "image/png")
+    body.extend(("--" + boundary + "--\r\n").encode())
+    req = urllib.request.Request(
+        mm["url"].rstrip("/") + "/api/v4/files", data=bytes(body), method="POST",
+        headers={"Authorization": f"Bearer {mm['token']}",
+                 "Content-Type": "multipart/form-data; boundary=" + boundary})
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        infos = json.loads(resp.read().decode("utf-8", "replace")).get("file_infos", [])
+    return infos[0]["id"] if infos else None
+
+
+def _chart_ids(mm, label, values, accent_hex):
+    """Render a trend line as a PNG and upload it → [file_id] for the post, or None
+    (too few points, rich off, or any render/upload failure — never fatal)."""
+    if not mm.get("rich", True):
         return None
     vals = [v for v in values if isinstance(v, (int, float))]
-    cur = fmt.format(vals[-1]) + unit
-    rng = f"{fmt.format(min(vals))}–{fmt.format(max(vals))}{unit}"
-    return _field(f"{label} · last {len(vals)} (now {cur})",
-                  f"`{spark}`  range {rng}", short=False)
+    if len(vals) < 2:
+        return None
+    try:
+        png = chart.line_png(vals, accent=_hex_rgb(accent_hex))
+        if not png:
+            return None
+        fid = _upload_png(mm, label.lower().replace(" ", "_").replace("%", "pct") + ".png", png)
+        return [fid] if fid else None
+    except Exception as exc:  # noqa: BLE001 — a missing chart must not drop the alert
+        print(f"[argus] chart render/upload failed: {exc}", flush=True)
+        return None
 
 
 # Per-target drill-down pages (served at {public_url}/{page}); anything not listed
@@ -440,11 +474,13 @@ def _link_field(mm, page=None):
     return _field("Details", f"[Open in Argus →]({url})", short=False) if url else None
 
 
-def post_mattermost(mm, text, attachments=None):
+def post_mattermost(mm, text, attachments=None, file_ids=None):
     url = mm["url"].rstrip("/") + "/api/v4/posts"
     body = {"channel_id": mm["channel_id"], "message": text}
     if attachments:
         body["props"] = {"attachments": attachments}
+    if file_ids:
+        body["file_ids"] = file_ids
     payload = json.dumps(body).encode()
     req = urllib.request.Request(
         url,
@@ -463,15 +499,19 @@ def post_mattermost(mm, text, attachments=None):
         return False
 
 
-def _post(mm, text, color=None, fields=None):
+def _post(mm, text, color=None, fields=None, chart=None):
     """Post a headline plus (when rich alerts are enabled) a colour-barred
-    attachment carrying metric fields and a sparkline. Falls back to the plain
-    one-liner when mm.rich is off, so the alert is never lost."""
-    attachments = None
-    if mm.get("rich", True) and fields:
-        attachments = [{"color": color or C_DOWN, "mrkdwn_in": ["text", "fields"],
-                        "fields": fields, "footer": "Argus · the all-seeing watch"}]
-    post_mattermost(mm, text, attachments)
+    attachment with metric fields and a rendered trend-line chart image. `chart`
+    is an optional (label, values) pair. Falls back to the plain one-liner when
+    mm.rich is off, so the alert is never lost."""
+    attachments = file_ids = None
+    if mm.get("rich", True):
+        if fields:
+            attachments = [{"color": color or C_DOWN, "mrkdwn_in": ["text", "fields"],
+                            "fields": fields, "footer": "Argus · the all-seeing watch"}]
+        if chart:
+            file_ids = _chart_ids(mm, chart[0], chart[1], color or C_DOWN)
+    post_mattermost(mm, text, attachments, file_ids)
 
 
 def alert(mm, target, new_status, detail, store=None, page=None, since=None):
@@ -483,11 +523,14 @@ def alert(mm, target, new_status, detail, store=None, page=None, since=None):
     else:
         text = f"👁 **Argus** · :large_green_circle: **{target}** RECOVERED — {detail}"
     fields = _timing_fields(down, since, verb="Down")
+    chart_spec = None
     if store:
         hist = store.history(target, hours=2, limit=240)
-        sf = _spark_field("Latency", [h["latency_ms"] for h in hist], unit="ms")
-        if sf:
-            fields.append(sf)
+        latency = [h["latency_ms"] for h in hist]
+        cap = _trend_caption("Latency", latency, unit="ms")
+        if cap:
+            fields.append(cap)
+            chart_spec = ("Latency", latency)
         statuses = [h["status"] for h in hist]
         if statuses:
             up = sum(1 for s in statuses if s == "up")
@@ -496,7 +539,7 @@ def alert(mm, target, new_status, detail, store=None, page=None, since=None):
     lf = _link_field(mm, page)
     if lf:
         fields.append(lf)
-    _post(mm, text, C_UP if not down else C_DOWN, fields)
+    _post(mm, text, C_UP if not down else C_DOWN, fields, chart_spec)
 
 
 def heartbeat(mm, snap):
@@ -592,16 +635,17 @@ def post_mongo_perf(mm, degraded, reasons, metrics=None, store=None, since=None)
             fields.append(_field("Storage queue", str(metrics["queue"])))
         if metrics.get("conns") is not None:
             fields.append(_field("Connections", str(metrics["conns"])))
+    chart_spec = None
     if store:
-        sf = _spark_field("Write latency",
-                          [h["write_ms"] for h in store.mongo_history(hours=3)],
-                          unit="ms", fmt="{:.1f}")
-        if sf:
-            fields.append(sf)
+        wl = [h["write_ms"] for h in store.mongo_history(hours=3)]
+        cap = _trend_caption("Write latency", wl, unit="ms", fmt="{:.1f}")
+        if cap:
+            fields.append(cap)
+            chart_spec = ("Write latency", wl)
     lf = _link_field(mm, "mongo.html")
     if lf:
         fields.append(lf)
-    _post(mm, text, C_DOWN if degraded else C_UP, fields)
+    _post(mm, text, C_DOWN if degraded else C_UP, fields, chart_spec)
 
 
 def eval_elastic_perf(prev, cur, thr, dt):
@@ -668,11 +712,11 @@ def eval_kafka_perf(prev, cur, thr, dt):
     return bool(reasons), reasons, m
 
 
-def post_perf(mm, name, degraded, reasons, fields=None, since=None, page=None):
+def post_perf(mm, name, degraded, reasons, fields=None, since=None, page=None, chart=None):
     """Mattermost transition alert for a service's degraded<->healthy flip. The
-    caller passes service-specific metric/sparkline `fields` (see _es_fields /
-    _kafka_fields / _internet_fields), the alarm-open time `since` (for the recovery
-    duration), and the drill-down `page` to deep-link."""
+    caller passes service-specific metric `fields` + a (label, values) `chart`
+    (see _es_fields / _kafka_fields / _internet_fields), the alarm-open time
+    `since` (for the recovery duration), and the drill-down `page` to deep-link."""
     if not mm.get("enable"):
         return
     if degraded:
@@ -686,11 +730,11 @@ def post_perf(mm, name, degraded, reasons, fields=None, since=None, page=None):
     lf = _link_field(mm, page)
     if lf:
         all_fields.append(lf)
-    _post(mm, text, C_DOWN if degraded else C_UP, all_fields)
+    _post(mm, text, C_DOWN if degraded else C_UP, all_fields, chart)
 
 
 def _es_fields(metrics, store):
-    """Metric + heap-trend fields for an Elasticsearch degraded/recovered alert."""
+    """(fields, chart) for an Elasticsearch alert — metrics + a heap-% trend."""
     fields = []
     if metrics:
         if metrics.get("status"):
@@ -703,16 +747,18 @@ def _es_fields(metrics, store):
             fields.append(_field("Unassigned shards", str(metrics["unassigned"])))
         if metrics.get("search_qps") is not None:
             fields.append(_field("Search q/s", f"{metrics['search_qps']:.1f}"))
+    chart_spec = None
     if store:
-        sf = _spark_field("Heap %",
-                          [h["heap_pct"] for h in store.elastic_history(hours=3)], unit="%")
-        if sf:
-            fields.append(sf)
-    return fields
+        heap = [h["heap_pct"] for h in store.elastic_history(hours=3)]
+        cap = _trend_caption("Heap %", heap, unit="%")
+        if cap:
+            fields.append(cap)
+            chart_spec = ("Heap %", heap)
+    return fields, chart_spec
 
 
 def _kafka_fields(metrics, store):
-    """Metric + lag/throughput-trend fields for a Kafka degraded/recovered alert."""
+    """(fields, chart) for a Kafka alert — metrics + a lag (or throughput) trend."""
     fields = []
     if metrics:
         for title, key in (("Brokers", "brokers"), ("Partitions", "partitions"),
@@ -725,28 +771,35 @@ def _kafka_fields(metrics, store):
             fields.append(_field("Consumer lag", f"{metrics['total_lag']:,}"))
         if metrics.get("msgs_per_sec") is not None:
             fields.append(_field("Throughput", f"{metrics['msgs_per_sec']:.1f} msg/s"))
+    chart_spec = None
     if store:
         hist = store.kafka_history(hours=3)
-        sf = _spark_field("Consumer lag", [h["total_lag"] for h in hist])
-        if sf is None:  # lag flat/empty → show throughput instead
-            sf = _spark_field("Throughput", [h["msgs_per_sec"] for h in hist],
-                              unit=" msg/s", fmt="{:.1f}")
-        if sf:
-            fields.append(sf)
-    return fields
+        lag = [h["total_lag"] for h in hist]
+        if any(v for v in lag if isinstance(v, (int, float))):   # lag has signal
+            cap = _trend_caption("Consumer lag", lag)
+            label, series = "Consumer lag", lag
+        else:                                                    # flat/empty → throughput
+            series = [h["msgs_per_sec"] for h in hist]
+            cap = _trend_caption("Throughput", series, unit=" msg/s", fmt="{:.1f}")
+            label = "Throughput"
+        if cap:
+            fields.append(cap)
+            chart_spec = (label, series)
+    return fields, chart_spec
 
 
 def _internet_fields(slow_pairs, store):
-    """Per-URL latency fields + a latency sparkline for the worst URL."""
+    """(fields, chart) for an Internet QoS alert — per-URL latency + worst-URL trend."""
     fields = [_field(nm, f"{lat}ms") for nm, lat in slow_pairs]
+    chart_spec = None
     if store and slow_pairs:
         worst = max(slow_pairs, key=lambda p: p[1])[0]
-        sf = _spark_field(f"{worst} latency",
-                          [h["latency_ms"] for h in store.history(worst, hours=2, limit=240)],
-                          unit="ms")
-        if sf:
-            fields.append(sf)
-    return fields
+        lat = [h["latency_ms"] for h in store.history(worst, hours=2, limit=240)]
+        cap = _trend_caption(f"{worst} latency", lat, unit="ms")
+        if cap:
+            fields.append(cap)
+            chart_spec = (f"{worst} latency", lat)
+    return fields, chart_spec
 
 
 def monitor_loop(cfg, state, store=None, host_latest=None,
@@ -835,9 +888,10 @@ def monitor_loop(cfg, state, store=None, host_latest=None,
                 else:
                     since = internet_since
                     internet_since = None
+                it_fields, it_chart = _internet_fields(slow_pairs, store)
                 post_perf(mm, "Internet QoS", internet_degraded, slow,
-                          _internet_fields(slow_pairs, store), since=since,
-                          page="internet.html")
+                          it_fields, since=since, page="internet.html",
+                          chart=it_chart)
                 if store:
                     store.insert_event(
                         "internet", "perf",
@@ -895,9 +949,10 @@ def monitor_loop(cfg, state, store=None, host_latest=None,
                     else:
                         since = es_since
                         es_since = None
+                    es_fields, es_chart = _es_fields(metrics, store)
                     post_perf(mm, "Elasticsearch", degraded, reasons,
-                              _es_fields(metrics, store), since=since,
-                              page="elastic.html")
+                              es_fields, since=since, page="elastic.html",
+                              chart=es_chart)
                     if store:
                         store.insert_event(
                             "elasticsearch", "perf",
@@ -934,9 +989,10 @@ def monitor_loop(cfg, state, store=None, host_latest=None,
                     else:
                         since = kafka_since
                         kafka_since = None
+                    kf_fields, kf_chart = _kafka_fields(metrics, store)
                     post_perf(mm, "Kafka", degraded, reasons,
-                              _kafka_fields(metrics, store), since=since,
-                              page="kafka.html")
+                              kf_fields, since=since, page="kafka.html",
+                              chart=kf_chart)
                     if store:
                         store.insert_event(
                             "kafka", "perf",

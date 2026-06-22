@@ -6,7 +6,7 @@ WORKDIR /app
 # Mongo box (Mongo's API can't report host metrics).
 RUN apt-get update && apt-get install -y --no-install-recommends openssh-client \
     && rm -rf /var/lib/apt/lists/*
-COPY app.py mongo.py ollama.py elastic.py kafka.py store.py hoststat.py ./
+COPY app.py mongo.py ollama.py elastic.py kafka.py store.py hoststat.py chart.py ./
 COPY static/ ./static/
 
 # Drop privileges — the monitor needs outbound network, its listen port, and

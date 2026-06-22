@@ -3,6 +3,30 @@
 Running notes for the `hermie` repo so I can catch myself up across sessions.
 Newest context at the top of each section. **No secrets in this file.**
 
+## 2026-06-22 — Argus: replace the Unicode sparkline with a real rendered PNG chart — DEPLOYED
+- User: "we can do better than that lame blocky black-and-white graph." Replaced the
+  `▁▂▃` sparkline with an actual **colour line-chart image** attached to the alert —
+  still **zero deps** (Argus ships no pip pkgs), so the PNG is hand-rolled.
+- **`chart.py`** (NEW, pure stdlib): `line_png(values, accent, width=600, height=170,
+  scale=2)` draws onto an RGB framebuffer and encodes a truecolour PNG via `zlib`
+  (`_encode_png`: filter-0 scanlines + IHDR/IDAT/IEND chunks, CRC). Dark "Obsidian"
+  theme (slate bg + faint gridlines), translucent-look filled area (`_blend` fakes
+  alpha on opaque RGB), accent trend line, slate-100 marker dot on the latest sample.
+  Renders at 2× for crisp downscaling; ~3KB PNG, 1200×340.
+- **`app.py`**: `_upload_png(mm,name,data)` POSTs multipart to **`/api/v4/files`**
+  (hand-built boundary body) → file id; `_chart_ids()` renders+uploads (guarded —
+  any failure just drops the image, never the alert); `post_mattermost` gained a
+  `file_ids` arg; `_post(mm,text,color,fields,chart=(label,values))` uploads the chart
+  and attaches it. The blocky `_sparkline`/`_spark_field` are GONE — replaced by
+  `_trend_caption` (text "now X · range lo–hi", no block chars). The `_es_fields`/
+  `_kafka_fields`/`_internet_fields` builders now return **(fields, chart)** tuples;
+  loop call sites unpack them. `alert()`/`post_mongo_perf` build their own chart.
+- **Dockerfile** COPY now includes `chart.py` (per the recurring "list new modules"
+  lesson). Accent colour = the attachment colour (red degraded/down, green recovered).
+- ✅ Logic unit-tested; ✅ deployed `--tags monitoring`; ✅ **verified live**: a TEST
+  ES-degraded alert uploaded a real PNG, fetched it back from the MM files API (valid
+  1200×340 PNG, filled red line + marker), then deleted the test post.
+
 ## 2026-06-22 — Argus: rich Mattermost alerts (color + metric fields + sparkline) — DEPLOYED
 - User wanted more detail / a graph in the Argus alerts that post to Mattermost.
   Kept the **no-deps ethos** — no matplotlib / no image upload. The "graph" is a
