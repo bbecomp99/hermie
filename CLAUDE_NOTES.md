@@ -24,6 +24,21 @@ Newest context at the top of each section. **No secrets in this file.**
   takes prebuilt `fields`. `heartbeat()` → up/down counts + down/degraded lists.
 - Config: **`monitor_mm_rich`** (default true) → config.json `mattermost.rich` →
   `mm.setdefault("rich",True)`. Set false to revert to plain text.
+- **Follow-up same day — fire time / outage span / deep-link (DEPLOYED+verified):**
+  every alert now leads with a timing field — **"Fired" <UTC ts>** when it opens,
+  **"Down for"/"Degraded for" <span>** + **"Recovered" <UTC ts>** when it clears
+  (`_timing_fields(active, since, verb)`, `_fmt_ts`, `_fmt_duration`). Outage-open
+  times are tracked **in-memory** in `monitor_loop` (`outage_since` dict for up/down;
+  `mongo_since`/`es_since`/`kafka_since`/`internet_since` for perf) — a mid-outage
+  restart just omits the span (since=None → no duration field, no crash). Each alert
+  also appends a **"Details → Open in Argus"** markdown link to its drill-down page
+  (`_link_field`/`_detail_url`; `DETAIL_PAGES` maps mongodb/elasticsearch/kafka/
+  ollama → *.html, internet group → internet.html, everything else → dashboard root;
+  heartbeat → root). New config **`monitor_public_url`** (default
+  `http://.128:9200`) → config.json top-level `public_url` → copied into
+  `mm["public_url"]`; blank URL ⇒ link field omitted. Verified live: a synthetic
+  Kafka "recovered" rendered green with "Degraded for 1h 05m" + Recovered ts +
+  kafka.html link; test posts deleted after.
 - ✅ Logic unit-tested locally (sparkline/fields/fallback). ✅ Deployed
   `--tags monitoring` (rebuild+restart, failed=0), config.json shows `rich:true`.
   ✅ **Verified live in Mattermost**: a TEST post via the real `app._post` rendered

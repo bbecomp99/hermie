@@ -2,6 +2,7 @@
   "interval": {{ monitor_interval }},
   "listen_port": {{ monitor_port }},
   "heartbeat_interval": {{ monitor_heartbeat_interval }},
+  "public_url": {{ monitor_public_url | to_json }},
   "mattermost": {
     "enable": {{ monitor_mm_enable | bool | to_json }},
     "url": {{ monitor_mm_url | to_json }},
