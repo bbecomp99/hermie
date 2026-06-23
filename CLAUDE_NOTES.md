@@ -3,6 +3,30 @@
 Running notes for the `hermie` repo so I can catch myself up across sessions.
 Newest context at the top of each section. **No secrets in this file.**
 
+## 2026-06-23 — Smaller alert charts + Mattermost 11.6.4 → 11.8.1 upgrade — DEPLOYED
+- **Chart shrink:** `chart.py` `line_png` defaults 600×170 → **440×120** (×2 scale ⇒
+  880×240, ~2.2KB vs the old 1200×340/~3.3KB). Deployed `--tags monitoring`.
+- **Mattermost upgrade (prod):** `mm_version` 11.6.4 → **11.8.1** (latest stable team-
+  edition on Docker Hub; 11.9.0 was only an RC). Minor bump within 11.x → safe; MM ran
+  its DB migrations on first boot (all logged `migrated`, server listening, ping OK).
+  - **Made the role targetable:** `playbook.yml` mattermost role now has
+    `tags: ['mattermost','mm']` (was untagged) → deploy just it with `--tags mattermost`.
+    Mechanism: bump `mm_version` → docker-compose.yml re-templated → handler
+    `docker compose up -d` pulls the tag + recreates the `mattermost` container; postgres
+    + the app/config & postgres volumes persist; migrations auto-run.
+  - **Safety checkpoint taken first** (on .128, in `/home/pinky/`):
+    `mm-db-backup-<ts>.sql.gz` (pg_dump of mmuser/mattermost via
+    `docker compose exec -T postgres pg_dump`, 427K/12.8k lines) +
+    `mm-config-backup-<ts>.tgz` (volumes/app/config). Rollback = restore the dump +
+    pin `mm_version` back (image-only revert won't work — newer schema).
+  - **Known retry noise:** the "Bring up the Mattermost stack" task FAILED-RETRYING a
+    few times before succeeding — that's the documented .128 IPv6 pull flakiness
+    (`retries:5`), not a real failure (`failed=0`).
+  - **Verified:** X-Version-Id 11.8.1, container `Up (healthy)`, and the **hermes
+    gateway auto-reconnected** its websocket (saw "Server disconnected", backed off,
+    "WebSocket connected and authenticated"). Log errors (ffmpeg/calls-STUN/playbooks-
+    license/SMTP/github-plugin) are all pre-existing Team-Edition/unconfigured noise.
+
 ## 2026-06-22 — Argus: replace the Unicode sparkline with a real rendered PNG chart — DEPLOYED
 - User: "we can do better than that lame blocky black-and-white graph." Replaced the
   `▁▂▃` sparkline with an actual **colour line-chart image** attached to the alert —

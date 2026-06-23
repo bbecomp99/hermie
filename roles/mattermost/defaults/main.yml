@@ -1,7 +1,7 @@
 ---
 # Self-hosted Mattermost (Slack-like) on the same host as hermes, via Docker.
 mm_dir: "{{ ansible_env.HOME }}/mattermost"     # compose project dir on .128
-mm_version: "11.6.4"                            # mattermost-team-edition tag
+mm_version: "11.8.1"                            # mattermost-team-edition tag
 mm_pg_image: "postgres:15-alpine"
 mm_port: 8065                                   # host port -> container 8065
 mm_bind: "0.0.0.0"                              # LAN-reachable

@@ -40,12 +40,12 @@ def _encode_png(width, height, buf):
             + chunk(b"IEND", b""))
 
 
-def line_png(values, accent=(96, 165, 250), width=600, height=170, scale=2):
+def line_png(values, accent=(96, 165, 250), width=440, height=120, scale=2):
     """Render `values` (a numeric series, ≥2 points) as a filled trend line.
 
     `accent` is the line/fill/marker colour (RGB). Rendered at `scale`× for crisp
-    downscaling in chat clients. Returns PNG bytes, or None when there's nothing
-    meaningful to draw."""
+    downscaling in chat clients (default 880×240, ~2KB). Returns PNG bytes, or None
+    when there's nothing meaningful to draw."""
     vals = [float(v) for v in values if isinstance(v, (int, float))]
     if len(vals) < 2:
         return None
