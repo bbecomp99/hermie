@@ -3,6 +3,13 @@
 Running notes for the `hermie` repo so I can catch myself up across sessions.
 Newest context at the top of each section. **No secrets in this file.**
 
+## 2026-06-23 — Argus alerts moved to a dedicated #argus-alerts channel — DEPLOYED
+- `monitor_mm_channel_id` was `{{ mm_home_channel }}` (shared Town Square) → now the
+  explicit **`eoph5fp57fd3xguarwq74sma8o`** = the public **#argus-alerts** channel.
+  Verified the hermie bot (`qujws1pgkjgw7kmnhgqdqetchh`) is already a member (post
+  200). Deployed `--tags monitoring`; live config + a test post confirmed landing in
+  #argus-alerts (test deleted). Override per-deploy with `-e monitor_mm_channel_id=…`.
+
 ## 2026-06-23 — Smaller alert charts + Mattermost 11.6.4 → 11.8.1 upgrade — DEPLOYED
 - **Chart shrink:** `chart.py` `line_png` defaults 600×170 → **440×120** (×2 scale ⇒
   880×240, ~2.2KB vs the old 1200×340/~3.3KB). Deployed `--tags monitoring`.

@@ -113,7 +113,9 @@ monitor_host_142: "192.168.88.142"              # the LAN MongoDB box
 # a bridged container where 127.0.0.1 is the container itself, not the host.
 monitor_mm_enable: true
 monitor_mm_url: "http://{{ monitor_host_128 }}:8065"
-monitor_mm_channel_id: "{{ mm_home_channel | default('') }}"
+# Dedicated #argus-alerts channel (was the shared home channel). Override per-deploy
+# with -e monitor_mm_channel_id=... if needed.
+monitor_mm_channel_id: "eoph5fp57fd3xguarwq74sma8o"
 # Rich alerts: each up/down/degraded post carries a colour-barred attachment with
 # metric fields + a Unicode sparkline trend (pulled from SQLite history) — no extra
 # deps, no image uploads. Set false to fall back to the plain one-line messages.
