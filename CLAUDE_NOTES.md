@@ -3,6 +3,98 @@
 Running notes for the `hermie` repo so I can catch myself up across sessions.
 Newest context at the top of each section. **No secrets in this file.**
 
+## 2026-06-23 — Smaller alert charts + Mattermost 11.6.4 → 11.8.1 upgrade — DEPLOYED
+- **Chart shrink:** `chart.py` `line_png` defaults 600×170 → **440×120** (×2 scale ⇒
+  880×240, ~2.2KB vs the old 1200×340/~3.3KB). Deployed `--tags monitoring`.
+- **Mattermost upgrade (prod):** `mm_version` 11.6.4 → **11.8.1** (latest stable team-
+  edition on Docker Hub; 11.9.0 was only an RC). Minor bump within 11.x → safe; MM ran
+  its DB migrations on first boot (all logged `migrated`, server listening, ping OK).
+  - **Made the role targetable:** `playbook.yml` mattermost role now has
+    `tags: ['mattermost','mm']` (was untagged) → deploy just it with `--tags mattermost`.
+    Mechanism: bump `mm_version` → docker-compose.yml re-templated → handler
+    `docker compose up -d` pulls the tag + recreates the `mattermost` container; postgres
+    + the app/config & postgres volumes persist; migrations auto-run.
+  - **Safety checkpoint taken first** (on .128, in `/home/pinky/`):
+    `mm-db-backup-<ts>.sql.gz` (pg_dump of mmuser/mattermost via
+    `docker compose exec -T postgres pg_dump`, 427K/12.8k lines) +
+    `mm-config-backup-<ts>.tgz` (volumes/app/config). Rollback = restore the dump +
+    pin `mm_version` back (image-only revert won't work — newer schema).
+  - **Known retry noise:** the "Bring up the Mattermost stack" task FAILED-RETRYING a
+    few times before succeeding — that's the documented .128 IPv6 pull flakiness
+    (`retries:5`), not a real failure (`failed=0`).
+  - **Verified:** X-Version-Id 11.8.1, container `Up (healthy)`, and the **hermes
+    gateway auto-reconnected** its websocket (saw "Server disconnected", backed off,
+    "WebSocket connected and authenticated"). Log errors (ffmpeg/calls-STUN/playbooks-
+    license/SMTP/github-plugin) are all pre-existing Team-Edition/unconfigured noise.
+
+## 2026-06-22 — Argus: replace the Unicode sparkline with a real rendered PNG chart — DEPLOYED
+- User: "we can do better than that lame blocky black-and-white graph." Replaced the
+  `▁▂▃` sparkline with an actual **colour line-chart image** attached to the alert —
+  still **zero deps** (Argus ships no pip pkgs), so the PNG is hand-rolled.
+- **`chart.py`** (NEW, pure stdlib): `line_png(values, accent, width=600, height=170,
+  scale=2)` draws onto an RGB framebuffer and encodes a truecolour PNG via `zlib`
+  (`_encode_png`: filter-0 scanlines + IHDR/IDAT/IEND chunks, CRC). Dark "Obsidian"
+  theme (slate bg + faint gridlines), translucent-look filled area (`_blend` fakes
+  alpha on opaque RGB), accent trend line, slate-100 marker dot on the latest sample.
+  Renders at 2× for crisp downscaling; ~3KB PNG, 1200×340.
+- **`app.py`**: `_upload_png(mm,name,data)` POSTs multipart to **`/api/v4/files`**
+  (hand-built boundary body) → file id; `_chart_ids()` renders+uploads (guarded —
+  any failure just drops the image, never the alert); `post_mattermost` gained a
+  `file_ids` arg; `_post(mm,text,color,fields,chart=(label,values))` uploads the chart
+  and attaches it. The blocky `_sparkline`/`_spark_field` are GONE — replaced by
+  `_trend_caption` (text "now X · range lo–hi", no block chars). The `_es_fields`/
+  `_kafka_fields`/`_internet_fields` builders now return **(fields, chart)** tuples;
+  loop call sites unpack them. `alert()`/`post_mongo_perf` build their own chart.
+- **Dockerfile** COPY now includes `chart.py` (per the recurring "list new modules"
+  lesson). Accent colour = the attachment colour (red degraded/down, green recovered).
+- ✅ Logic unit-tested; ✅ deployed `--tags monitoring`; ✅ **verified live**: a TEST
+  ES-degraded alert uploaded a real PNG, fetched it back from the MM files API (valid
+  1200×340 PNG, filled red line + marker), then deleted the test post.
+
+## 2026-06-22 — Argus: rich Mattermost alerts (color + metric fields + sparkline) — DEPLOYED
+- User wanted more detail / a graph in the Argus alerts that post to Mattermost.
+  Kept the **no-deps ethos** — no matplotlib / no image upload. The "graph" is a
+  **Unicode sparkline** (`▁▂▃▄▅▆▇█`) built from the existing SQLite history, wrapped
+  in a **Mattermost message attachment** (Slack-compatible `props.attachments`:
+  colour bar + key/value fields).
+- **`app.py`** helpers: `_sparkline(values,width=30)` (None-skipping, flat→`▁`,
+  '' when <2 pts), `_field()`, `_spark_field(label,values,unit,fmt)` (sparkline +
+  "now X · range lo–hi"), `_post(mm,text,color,fields)` (builds the attachment when
+  `mm.rich`, else falls back to the plain one-liner). `post_mattermost()` now takes
+  optional `attachments`. Colours: `C_DOWN`#d24b4e / `C_UP`#3db887 / `C_WARN`#e0a800.
+- Each alert type enriched: **up/down** (`alert()`, +store) → latency sparkline +
+  2h uptime%; **Mongo** (`post_mongo_perf`, +metrics/store) → write/read/disk/queue/
+  conns + write-latency sparkline; **ES** (`_es_fields`) → cluster/heap/cpu/unassigned
+  /search-qps + heap% sparkline; **Kafka** (`_kafka_fields`) → brokers/partitions/
+  under-repl/offline/groups/lag/throughput + lag sparkline (falls back to throughput
+  if lag flat); **Internet QoS** (`_internet_fields`) → per-slow-URL latency + worst-URL
+  latency sparkline (loop now collects `slow_pairs`). `post_perf()` stays generic,
+  takes prebuilt `fields`. `heartbeat()` → up/down counts + down/degraded lists.
+- Config: **`monitor_mm_rich`** (default true) → config.json `mattermost.rich` →
+  `mm.setdefault("rich",True)`. Set false to revert to plain text.
+- **Follow-up same day — fire time / outage span / deep-link (DEPLOYED+verified):**
+  every alert now leads with a timing field — **"Fired" <UTC ts>** when it opens,
+  **"Down for"/"Degraded for" <span>** + **"Recovered" <UTC ts>** when it clears
+  (`_timing_fields(active, since, verb)`, `_fmt_ts`, `_fmt_duration`). Outage-open
+  times are tracked **in-memory** in `monitor_loop` (`outage_since` dict for up/down;
+  `mongo_since`/`es_since`/`kafka_since`/`internet_since` for perf) — a mid-outage
+  restart just omits the span (since=None → no duration field, no crash). Each alert
+  also appends a **"Details → Open in Argus"** markdown link to its drill-down page
+  (`_link_field`/`_detail_url`; `DETAIL_PAGES` maps mongodb/elasticsearch/kafka/
+  ollama → *.html, internet group → internet.html, everything else → dashboard root;
+  heartbeat → root). New config **`monitor_public_url`** (default
+  `http://.128:9200`) → config.json top-level `public_url` → copied into
+  `mm["public_url"]`; blank URL ⇒ link field omitted. Verified live: a synthetic
+  Kafka "recovered" rendered green with "Degraded for 1h 05m" + Recovered ts +
+  kafka.html link; test posts deleted after.
+- ✅ Logic unit-tested locally (sparkline/fields/fallback). ✅ Deployed
+  `--tags monitoring` (rebuild+restart, failed=0), config.json shows `rich:true`.
+  ✅ **Verified live in Mattermost**: a TEST post via the real `app._post` rendered
+  the red attachment with all fields + `▁▁▂▃▄▅▆▇█` range 58–92% (then deleted the
+  test posts). NOTE: a couple of internet alerts at ~11:24Z had no attachment —
+  they fired from the OLD container just before the 11:41Z restart, not a bug.
+  Real alerts only post on a state **transition**.
+
 ## 2026-06-18 — Ollama Cloud catalog rotation broke the canary + agent — FIXED & DEPLOYED
 - **Symptom:** the Argus Ollama drill-down stopped recording throughput (last
   canary 2026-06-16 06:52 UTC, trend went empty). Up/down `/api/version` ping was

@@ -12,6 +12,9 @@ monitor_port: 9200                              # host + container listen port
 monitor_bind: "0.0.0.0"                         # LAN-reachable (trusted home net)
 monitor_enable: true
 monitor_interval: 30                            # seconds between probe cycles
+# Base URL Argus links to from Mattermost alerts (LAN dashboard, no auth). Detail
+# pages live at {public_url}/{mongo,elastic,kafka,ollama,internet}.html.
+monitor_public_url: "http://{{ monitor_host_128 }}:{{ monitor_port }}"
 monitor_heartbeat_interval: 21600               # "all clear" heartbeat every 6h; 0 disables
 
 # MongoDB perf alerting — the in-engine equivalents of "disk queue rising / CPU
@@ -111,6 +114,10 @@ monitor_host_142: "192.168.88.142"              # the LAN MongoDB box
 monitor_mm_enable: true
 monitor_mm_url: "http://{{ monitor_host_128 }}:8065"
 monitor_mm_channel_id: "{{ mm_home_channel | default('') }}"
+# Rich alerts: each up/down/degraded post carries a colour-barred attachment with
+# metric fields + a Unicode sparkline trend (pulled from SQLite history) — no extra
+# deps, no image uploads. Set false to fall back to the plain one-line messages.
+monitor_mm_rich: true
 # monitor_mm_token defaults to mm_bot_token (vault); override per-deploy if needed.
 monitor_mm_token: "{{ mm_bot_token | default('') }}"
 

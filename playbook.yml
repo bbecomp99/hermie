@@ -6,7 +6,7 @@
   roles:
     - hermes
     - dashboard
-    - mattermost
+    - { role: mattermost, tags: ['mattermost', 'mm'] }
     - gateway
     - { role: homeassistant, tags: ['homeassistant', 'ha'] }
     - { role: weather, tags: ['weather'] }
