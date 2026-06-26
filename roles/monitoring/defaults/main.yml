@@ -130,6 +130,11 @@ monitor_internet_enable: true
 monitor_internet_group: "internet"     # probe group that feeds the QoS panel
 monitor_internet_poor_ms: 400          # latency above this is "poor" (amber on the page)
 monitor_internet_degrade_ms: 800       # reachable but slower than this => panel degraded
+# Fraction of internet targets that must be BAD (slow or down) in one cycle before
+# the QoS panel raises a Mattermost alarm. 1.0 = ALL of them (default) — one URL
+# spiking is that endpoint's problem, not the connection's, so the channel stays
+# quiet. Per-URL amber on the dashboard is unaffected. e.g. 0.6 => 2 of 3 URLs.
+monitor_internet_degrade_fraction: 1.0
 
 # LAN hosts (kept as vars so the target list below stays readable).
 monitor_host_128: "192.168.88.128"              # the agent box (this host)

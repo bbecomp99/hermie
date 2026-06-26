@@ -10,6 +10,7 @@ Secrets: Mattermost bot token via $MM_TOKEN and the Ollama Cloud key via
 $OLLAMA_API_KEY (never in the config file).
 """
 import json
+import math
 import os
 import socket
 import ssl
@@ -117,6 +118,11 @@ def load_config():
     it.setdefault("group", "internet")     # probe group that feeds the QoS panel
     it.setdefault("poor_ms", 400)          # latency above this is "poor" (amber)
     it.setdefault("degrade_ms", 800)       # reachable but slower than this => degraded
+    # Fraction of probed internet targets that must be BAD (slow or down) in the
+    # same cycle before the QoS panel raises a Mattermost alarm. 1.0 = ALL of them
+    # (one URL spiking is that endpoint's problem, not the connection's), which
+    # keeps the channel quiet. Per-URL amber on the dashboard is unaffected.
+    it.setdefault("degrade_min_fraction", 1.0)
     # Active window: the hours/days the tick pipeline is EXPECTED to be flowing.
     # The Kafka throughput-stall + ES freshness rules ONLY evaluate inside it, so
     # a legitimately idle poller (overnight / weekends) can't raise a false stall
@@ -876,6 +882,7 @@ def monitor_loop(cfg, state, store=None, host_latest=None,
     it = cfg["internet"]
     internet_group = it.get("group", "internet")
     internet_degrade_ms = int(it.get("degrade_ms", 800))
+    internet_degrade_fraction = float(it.get("degrade_min_fraction", 1.0))
     internet_names = {t["name"] for t in cfg["targets"]
                       if t.get("group") == internet_group and t["type"] == "http"}
     internet_degraded = False  # last posted panel state (alert on transitions only)
@@ -925,15 +932,20 @@ def monitor_loop(cfg, state, store=None, host_latest=None,
         if store and cycle_rows:
             store.insert_samples(cycle_rows)
 
-        # Internet QoS: a reachable-but-slow URL degrades the panel (amber on the
-        # dashboard + drill-down). One panel-level Mattermost transition, not per
-        # URL, so a flapping endpoint can't spam the channel.
+        # Internet QoS: a reachable-but-slow URL still paints that URL amber on the
+        # dashboard + drill-down (set_degraded per URL, below). But the Mattermost
+        # ALARM only fires when a fraction of the internet targets are bad (slow or
+        # down) in the same cycle — default ALL of them — so a single endpoint
+        # spiking can't spam the channel; only a real connection problem alerts.
         if it["enable"] and internet_names:
-            slow = []
-            slow_pairs = []
+            slow = []        # "name 1234ms" for slow-but-up URLs (alarm detail)
+            slow_pairs = []   # (name, latency) for slow URLs (feeds the chart)
+            bad = []          # names that are slow OR down (drives the panel alarm)
+            seen = 0          # internet targets actually probed this cycle
             for nm, new, latency in cycle_rows:
                 if nm not in internet_names:
                     continue
+                seen += 1
                 deg = new == "up" and latency is not None and latency > internet_degrade_ms
                 state.set_degraded(
                     nm, deg,
@@ -941,8 +953,13 @@ def monitor_loop(cfg, state, store=None, host_latest=None,
                 if deg:
                     slow.append(f"{nm} {latency}ms")
                     slow_pairs.append((nm, latency))
-            if bool(slow) != internet_degraded:
-                internet_degraded = bool(slow)
+                if deg or new != "up":
+                    bad.append(f"{nm} {latency}ms" if deg else f"{nm} down")
+            # Need this many bad targets to alarm (1.0 => all probed targets).
+            need = max(1, math.ceil(seen * internet_degrade_fraction)) if seen else 0
+            panel_bad = seen > 0 and len(bad) >= need
+            if panel_bad != internet_degraded:
+                internet_degraded = panel_bad
                 if internet_degraded:
                     internet_since = datetime.now(timezone.utc)
                     since = None
@@ -950,13 +967,13 @@ def monitor_loop(cfg, state, store=None, host_latest=None,
                     since = internet_since
                     internet_since = None
                 it_fields, it_chart = _internet_fields(slow_pairs, store)
-                post_perf(mm, "Internet QoS", internet_degraded, slow,
+                post_perf(mm, "Internet QoS", internet_degraded, bad,
                           it_fields, since=since, page="internet.html",
                           chart=it_chart)
                 if store:
                     store.insert_event(
                         "internet", "perf",
-                        ("degraded: " + "; ".join(slow)) if internet_degraded
+                        ("degraded: " + "; ".join(bad)) if internet_degraded
                         else "recovered")
 
         if mp["enable"] and mongo_t is not None:

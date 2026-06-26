@@ -3,6 +3,32 @@
 Running notes for the `hermie` repo so I can catch myself up across sessions.
 Newest context at the top of each section. **No secrets in this file.**
 
+## 2026-06-26 — Argus: de-noise the Internet QoS alarm (all-bad gate) — DEPLOYED
+- **Why:** the Internet QoS panel paged #argus-alerts the instant ANY single URL
+  crossed `degrade_ms` (800ms). With 3 trackers (google.com / api.massive.com /
+  starlink.com) one endpoint spiking = a flap that's the endpoint's problem, not the
+  connection's → noisy.
+- **Fix (alarm condition only):** the Mattermost transition now fires only when a
+  FRACTION of the probed internet targets are **bad in the same cycle**, where bad =
+  slow (`>degrade_ms`) **or** down/unreachable. New config
+  **`monitor_internet_degrade_fraction`** (config.json `internet.degrade_min_fraction`),
+  **default 1.0 = ALL of them**. Set `0.6` for "2 of 3". `need = ceil(seen*frac)`
+  (note 0.67×3 ceils to 3, so use 0.6 for two-of-three).
+- **Unchanged:** per-URL `state.set_degraded` still paints individual slow URLs amber
+  on the dashboard/drill-down — only the channel alarm got gated. Alarm detail now
+  also lists DOWN urls (e.g. `starlink.com down`), not just slow ones.
+- **Files:** `app.py` (`import math`; `it.setdefault("degrade_min_fraction",1.0)`;
+  read `internet_degrade_fraction`; rewrote the internet block in `monitor_loop` to
+  build a `bad` list + `panel_bad = len(bad) >= ceil(seen*frac)`),
+  `templates/config.json.j2` (new field), `defaults/main.yml`
+  (`monitor_internet_degrade_fraction: 1.0`).
+- **DEPLOYED 2026-06-26** (`--tags monitoring --diff`, become pinky via `.env` PASS).
+  Verified: config diff added `degrade_min_fraction: 1.0`; rebuild+restart `failed=0`;
+  `/healthz` ok; RUNNING `argus` container has `import math` + the new code and
+  `config.json` runtime value `1.0`. Live log at verify showed google.com 450ms (amber,
+  no longer alarms alone). Container name is **`argus`** (not "monitor") — `docker ps
+  --filter name=argus`. Truth table (3 targets, frac 1.0): only 3/3 bad alarms.
+
 ## 2026-06-25 — Argus: pipeline-STALL alerting (Kafka throughput + ES freshness) — DEPLOYED (uncommitted)
 - **Why:** the astonks tick pipeline wedged for ~28h (2026-06-24→25) and Argus never
   alerted. Root cause was a single-node Kafka broker that missed its own controller
