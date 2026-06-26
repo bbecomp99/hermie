@@ -69,6 +69,15 @@ monitor_elastic_password: ""                      # injected via ES_PASSWORD env
 monitor_elastic_heap_pct: 85                      # degrade if any node's JVM heap > this
 monitor_elastic_cpu_pct: 90                       # degrade if any node's CPU > this
 monitor_elastic_degrade_on_yellow: false          # don't sit amber on expected single-node yellow
+# Data-freshness canary (added 2026-06-25 after a ~28h pipeline wedge that every
+# per-service health check missed): degrade when the newest doc in a data stream
+# is older than the ceiling — a stale stream while the cluster is green means an
+# UPSTREAM stall (Kafka/poller/distributor), not an ES fault. Only evaluated
+# inside the active window (below), so an idle overnight/weekend poller is fine.
+monitor_elastic_freshness_enable: true
+monitor_elastic_freshness_index: "stonks-ticks"   # the hot tick data stream
+monitor_elastic_freshness_ts_field: "@timestamp"
+monitor_elastic_freshness_max_age_sec: 900         # 15 min stale → degrade
 
 # Kafka drill-down — speaks the Kafka wire protocol directly (no client lib) to
 # pull cluster metadata: brokers, active controller, topics, partitions, ISR.
@@ -87,6 +96,27 @@ monitor_kafka_min_brokers: 1                       # degrade if fewer brokers th
 monitor_kafka_track_traffic: true                  # show message throughput (msgs/sec)
 monitor_kafka_track_lag: true                      # show consumer-group lag (queue depth)
 monitor_kafka_lag_degrade: 0                        # total lag above this degrades; 0 = display only
+# Throughput-stall rule: a broker can stay "up" yet stop accepting produces — the
+# 2026-06-24 wedge (it missed its own controller heartbeat, got fenced, the group
+# coordinator resigned + never finished reloading __consumer_offsets). Log-end
+# offsets froze → msgs_per_sec ~0 while lag did NOT grow (nothing backing up), so
+# the offline/under-replicated/lag checks all stayed green. Degrade after N
+# consecutive in-window cycles at ~0 msg/s. stall_cycles=5 × interval=30s = ~2.5m,
+# comfortably longer than the poller's ~60s produce cadence (no flap false-trip).
+monitor_kafka_stall_enable: true
+monitor_kafka_stall_max_msgs_per_sec: 0.0          # <= this counts as "no traffic"
+monitor_kafka_stall_cycles: 5                      # consecutive idle cycles before degrade
+
+# Active window — the days/hours the tick pipeline is EXPECTED to be flowing. The
+# Kafka throughput-stall + ES freshness rules only evaluate inside it, so a
+# legitimately idle poller (overnight, weekends) can't raise a false stall alarm.
+# Default 03:00–19:00 America/Chicago Mon–Fri (covers pre-market → after-hours).
+# A rare market-holiday false alarm is accepted (keeps Argus market-calendar-free).
+monitor_active_window_enable: true
+monitor_active_window_tz: "America/Chicago"
+monitor_active_window_days: [0, 1, 2, 3, 4]        # 0=Mon .. 6=Sun
+monitor_active_window_start: "03:00"
+monitor_active_window_end: "19:00"
 
 # Internet QoS — "Global URL trackers". The internet-group HTTP probes in
 # monitor_targets below double as a quality-of-service panel: their per-cycle

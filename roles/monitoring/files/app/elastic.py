@@ -232,3 +232,41 @@ def perf_sample(base, username="", password="", timeout=8):
         "index_total": index_total,
         "rejected": rejected,
     }
+
+
+def freshness(base, index, ts_field="@timestamp", username="", password="",
+              timeout=8):
+    """Age (seconds) of the newest document in `index` by `ts_field` — the
+    end-to-end 'is fresh data still arriving?' canary. One cheap `max` aggregation
+    (size 0). Returns {ok, age_seconds, newest_iso, newest_ms}; age_seconds is
+    None when the index is empty. A STALE data stream while the cluster itself is
+    green means an UPSTREAM stall (Kafka / poller / distributor), not an ES fault
+    — which is exactly the 2026-06-24 wedge the per-service health checks missed."""
+    base = base.rstrip("/")
+    body = json.dumps({
+        "size": 0,
+        "track_total_hits": False,
+        "aggs": {"newest": {"max": {"field": ts_field}}},
+    }).encode()
+    try:
+        req = urllib.request.Request(
+            f"{base}/{index}/_search", data=body, method="POST",
+            headers={**_headers(username, password),
+                     "Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            doc = json.loads(resp.read().decode("utf-8", "replace"))
+    except urllib.error.HTTPError as exc:
+        return {"ok": False, "error": f"HTTP {exc.code} {exc.reason}"}
+    except urllib.error.URLError as exc:
+        return {"ok": False, "error": f"{type(exc).__name__}: "
+                f"{getattr(exc, 'reason', exc)}"}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+    newest_ms = _g(doc, "aggregations", "newest", "value")
+    if newest_ms is None:
+        return {"ok": True, "age_seconds": None, "newest_iso": None,
+                "newest_ms": None}
+    newest = datetime.fromtimestamp(newest_ms / 1000.0, tz=timezone.utc)
+    age = (datetime.now(timezone.utc) - newest).total_seconds()
+    return {"ok": True, "age_seconds": round(age),
+            "newest_iso": newest.isoformat(), "newest_ms": newest_ms}

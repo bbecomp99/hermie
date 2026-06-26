@@ -39,7 +39,11 @@
     "username": {{ monitor_elastic_username | to_json }},
     "heap_pct": {{ monitor_elastic_heap_pct }},
     "cpu_pct": {{ monitor_elastic_cpu_pct }},
-    "degrade_on_yellow": {{ monitor_elastic_degrade_on_yellow | bool | to_json }}
+    "degrade_on_yellow": {{ monitor_elastic_degrade_on_yellow | bool | to_json }},
+    "freshness_enable": {{ monitor_elastic_freshness_enable | bool | to_json }},
+    "freshness_index": {{ monitor_elastic_freshness_index | to_json }},
+    "freshness_ts_field": {{ monitor_elastic_freshness_ts_field | to_json }},
+    "freshness_max_age_sec": {{ monitor_elastic_freshness_max_age_sec }}
   },
   "kafka": {
     "enable": {{ monitor_kafka_enable | bool | to_json }},
@@ -49,7 +53,17 @@
     "min_brokers": {{ monitor_kafka_min_brokers }},
     "track_traffic": {{ monitor_kafka_track_traffic | bool | to_json }},
     "track_lag": {{ monitor_kafka_track_lag | bool | to_json }},
-    "lag_degrade": {{ monitor_kafka_lag_degrade }}
+    "lag_degrade": {{ monitor_kafka_lag_degrade }},
+    "stall_enable": {{ monitor_kafka_stall_enable | bool | to_json }},
+    "stall_max_msgs_per_sec": {{ monitor_kafka_stall_max_msgs_per_sec }},
+    "stall_cycles": {{ monitor_kafka_stall_cycles }}
+  },
+  "active_window": {
+    "enable": {{ monitor_active_window_enable | bool | to_json }},
+    "tz": {{ monitor_active_window_tz | to_json }},
+    "days": {{ monitor_active_window_days | to_json }},
+    "start": {{ monitor_active_window_start | to_json }},
+    "end": {{ monitor_active_window_end | to_json }}
   },
   "internet": {
     "enable": {{ monitor_internet_enable | bool | to_json }},

@@ -3,6 +3,55 @@
 Running notes for the `hermie` repo so I can catch myself up across sessions.
 Newest context at the top of each section. **No secrets in this file.**
 
+## 2026-06-25 — Argus: pipeline-STALL alerting (Kafka throughput + ES freshness) — DEPLOYED (uncommitted)
+- **Why:** the astonks tick pipeline wedged for ~28h (2026-06-24→25) and Argus never
+  alerted. Root cause was a single-node Kafka broker that missed its own controller
+  heartbeat (CPU/GC starvation on the shared MacBook — same oversubscription event as
+  the ES "crash"), got fenced, resigned the group coordinator + never finished
+  reloading `__consumer_offsets`. The broker stayed **process-up** with healthy
+  metadata, NO offline/under-replicated partitions, and produce was *failing* (not
+  backing up) so consumer **lag never grew** → every existing `eval_kafka_perf` rule
+  stayed green. `msgs_per_sec` dropped to ~0 but was display-only. (Full incident in
+  the astonks repo's CLAUDE_NOTES.)
+- **Two new degrade rules (both ONLY evaluated inside an "active window" so an idle
+  overnight/weekend poller can't false-alarm):**
+  1. **Kafka throughput-stall** (`app.py` `monitor_loop`): degrade after
+     `stall_cycles`(5) consecutive in-window cycles at `msgs_per_sec ≤
+     stall_max_msgs_per_sec`(0). Reuses the already-sampled throughput; streak state
+     lives in the loop; `msgs_per_sec=None` (first cycle / counter reset) is treated
+     as no-signal (resets the streak, never trips). 5×30s = ~2.5min, comfortably
+     longer than the poller's ~60s produce cadence so a between-burst 0 can't flap.
+  2. **ES data-freshness** (`elastic.freshness()` — new; one cheap `max(@timestamp)`
+     agg, size 0): degrade when the newest doc in `freshness_index`(`stonks-ticks`)
+     is older than `freshness_max_age_sec`(900s/15min). This is the true end-to-end
+     canary — fires whether Kafka, the poller, the distributor, OR ES ingestion is
+     the broken link. A stale stream while the cluster is GREEN = upstream stall, not
+     an ES fault. Folded into the existing ES degrade path (so it rides the existing
+     transition alert + `elastic.html` link).
+- **Active window** (`_in_active_window()` + `active_window` config): days/hours the
+  pipeline is expected to flow. Default **03:00–19:00 America/Chicago, Mon–Fri**
+  (pre-market→after-hours), `zoneinfo` (stdlib — Argus stays dep-free). `enable:false`
+  = always evaluate. Accepts a rare market-holiday false alarm (no market calendar).
+- **Files:** `app.py` (load_config defaults, `_in_active_window`/`_hhmm_to_min`
+  helpers, stall block in the kafka loop, freshness block in the ES loop),
+  `elastic.py` (`freshness()`), `templates/config.json.j2` (elastic `freshness_*`,
+  kafka `stall_*`, new `active_window` block), `defaults/main.yml` (the matching
+  `monitor_*` vars; all enabled by default). Validated: both modules `py_compile`
+  clean; `elastic.freshness()` against live ES returned `age_seconds:59` (fresh);
+  `_in_active_window` truth-table checks out.
+- **DEPLOYED 2026-06-25** (`--tags monitoring --diff --become-password-file`; become
+  user `pinky`, pw in the repo's gitignored `.env` as `PASS:`). Verified: image
+  rebuilt + stack restarted (`failed=0`), `/healthz` ok, rendered `config.json` has
+  the freshness/stall/active_window blocks, and the RUNNING container has the new
+  code (`grep def freshness /app/elastic.py`, `_in_active_window` ×9 in
+  /app/app.py). Rules were dormant at verify time (19:56 CT > 19:00 window end —
+  correct), so runtime trip not yet observed live.
+- **TODO:** during market/extended hours (03:00–19:00 CT) confirm a real stall trips
+  it — stop the astonks poller briefly → expect Kafka "no traffic" + `stonks-ticks
+  stale` degrade posts to #argus-alerts, then recovery. Optional: surface
+  `fresh_age_sec` / stall state on `elastic.html` / `kafka.html` (alerting works
+  without it). **Code uncommitted in git.**
+
 ## 2026-06-23 — Argus alerts moved to a dedicated #argus-alerts channel — DEPLOYED
 - `monitor_mm_channel_id` was `{{ mm_home_channel }}` (shared Town Square) → now the
   explicit **`eoph5fp57fd3xguarwq74sma8o`** = the public **#argus-alerts** channel.

@@ -20,6 +20,7 @@ import urllib.request
 from collections import deque
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from zoneinfo import ZoneInfo  # stdlib (py3.9+) — keeps Argus dependency-free
 
 import chart
 import elastic
@@ -86,6 +87,13 @@ def load_config():
     es.setdefault("heap_pct", 85)          # degrade if any node's JVM heap exceeds this
     es.setdefault("cpu_pct", 90)           # degrade if any node's CPU exceeds this
     es.setdefault("degrade_on_yellow", False)  # single-node clusters sit yellow normally
+    # Data-freshness canary: age of the newest doc in a data stream. A stale
+    # stream while the cluster is green = an UPSTREAM pipeline stall (the
+    # 2026-06-24 Kafka wedge symptom). Only evaluated inside active_window.
+    es.setdefault("freshness_enable", False)
+    es.setdefault("freshness_index", "stonks-ticks")
+    es.setdefault("freshness_ts_field", "@timestamp")
+    es.setdefault("freshness_max_age_sec", 900)  # degrade if newest doc older than this
     kf = cfg.setdefault("kafka", {})
     kf.setdefault("enable", False)
     kf.setdefault("host", "")
@@ -95,11 +103,31 @@ def load_config():
     kf.setdefault("track_traffic", True)   # pull log-end offsets → throughput
     kf.setdefault("track_lag", True)        # pull consumer-group committed offsets → lag
     kf.setdefault("lag_degrade", 0)        # total lag above this degrades (0 = display only)
+    # Throughput-stall rule: the broker can stay "up" (process alive, metadata
+    # healthy) yet stop accepting produces — log-end offsets freeze → msgs_per_sec
+    # ~0 while lag does NOT grow (nothing's backing up). That's the 2026-06-24
+    # wedge the offline/under-replicated/lag checks all missed. Degrade after
+    # `stall_cycles` consecutive cycles at <= stall_max_msgs_per_sec, but only
+    # inside active_window (so an idle overnight/weekend poller can't alarm).
+    kf.setdefault("stall_enable", False)
+    kf.setdefault("stall_max_msgs_per_sec", 0.0)  # <= this counts as "no traffic"
+    kf.setdefault("stall_cycles", 5)              # consecutive idle cycles before degrade
     it = cfg.setdefault("internet", {})
     it.setdefault("enable", False)
     it.setdefault("group", "internet")     # probe group that feeds the QoS panel
     it.setdefault("poor_ms", 400)          # latency above this is "poor" (amber)
     it.setdefault("degrade_ms", 800)       # reachable but slower than this => degraded
+    # Active window: the hours/days the tick pipeline is EXPECTED to be flowing.
+    # The Kafka throughput-stall + ES freshness rules ONLY evaluate inside it, so
+    # a legitimately idle poller (overnight / weekends) can't raise a false stall
+    # alarm. Default 03:00–19:00 America/Chicago, Mon–Fri (covers extended hours).
+    # A rare market-holiday false alarm is accepted (no market-calendar dep).
+    aw = cfg.setdefault("active_window", {})
+    aw.setdefault("enable", True)
+    aw.setdefault("tz", "America/Chicago")
+    aw.setdefault("days", [0, 1, 2, 3, 4])  # 0=Mon .. 6=Sun
+    aw.setdefault("start", "03:00")
+    aw.setdefault("end", "19:00")
     return cfg
 
 
@@ -255,6 +283,38 @@ def _describe(t):
     if t["type"] == "tcp":
         return f"tcp://{t['host']}:{t['port']}"
     return t["type"]
+
+
+def _hhmm_to_min(s, default):
+    try:
+        hh, mm = str(s).split(":")
+        return int(hh) * 60 + int(mm)
+    except Exception:  # noqa: BLE001
+        return default
+
+
+def _in_active_window(win):
+    """True if 'now' falls inside the configured active window — the days/hours
+    the tick pipeline is expected to be flowing. The stall + freshness rules use
+    this to skip evaluation when the poller is legitimately idle (overnight /
+    weekends), so an expected gap can't masquerade as an outage. A disabled
+    window ({'enable': False}) means 'always active' (evaluate every cycle)."""
+    if not win.get("enable", False):
+        return True
+    try:
+        tz = ZoneInfo(win.get("tz", "America/Chicago"))
+    except Exception:  # noqa: BLE001 - bad tz string → fall back to UTC, never crash
+        tz = timezone.utc
+    now = datetime.now(tz)
+    days = win.get("days")
+    if days and now.weekday() not in days:
+        return False
+    start = _hhmm_to_min(win.get("start", "03:00"), 3 * 60)
+    end = _hhmm_to_min(win.get("end", "19:00"), 19 * 60)
+    minute = now.hour * 60 + now.minute
+    if start <= end:
+        return start <= minute < end
+    return minute >= start or minute < end   # window straddles midnight
 
 
 # ---------------------------------------------------------------------------
@@ -831,6 +891,7 @@ def monitor_loop(cfg, state, store=None, host_latest=None,
     kafka_prev = None      # previous Kafka perf_sample for delta-based throughput
     kafka_degraded = False
     kafka_since = None
+    kafka_stall_streak = 0  # consecutive in-window cycles at ~0 msgs/sec
     # When each down target's outage opened, so a RECOVERED alert can report how
     # long it was down (in-memory; a mid-outage restart simply omits the span).
     outage_since = {}
@@ -932,6 +993,23 @@ def monitor_loop(cfg, state, store=None, host_latest=None,
             if cur:
                 degraded, reasons, metrics = eval_elastic_perf(
                     es_prev, cur, es, dt=interval)
+                # Data-freshness canary (in-window only): a stale data stream while
+                # the cluster is green = an UPSTREAM stall, not an ES fault — the
+                # end-to-end signal that the per-service health checks all missed.
+                if es.get("freshness_enable") and _in_active_window(cfg["active_window"]):
+                    fr = elastic.freshness(
+                        es["url"], es.get("freshness_index", "stonks-ticks"),
+                        es.get("freshness_ts_field", "@timestamp"),
+                        es.get("username", ""), es.get("password", ""), timeout=8)
+                    metrics["fresh_age_sec"] = fr.get("age_seconds")
+                    max_age = es.get("freshness_max_age_sec", 900)
+                    if (fr.get("ok") and fr.get("age_seconds") is not None
+                            and fr["age_seconds"] > max_age):
+                        degraded = True
+                        reasons.append(
+                            f"{es.get('freshness_index', 'stonks-ticks')} stale: "
+                            f"newest doc {_fmt_duration(fr['age_seconds'])} old "
+                            f"(>{_fmt_duration(max_age)})")
                 state.set_degraded("elasticsearch", degraded, "; ".join(reasons))
                 if elastic_latest is not None:
                     elastic_latest.clear()
@@ -968,6 +1046,25 @@ def monitor_loop(cfg, state, store=None, host_latest=None,
             if cur:
                 degraded, reasons, metrics = eval_kafka_perf(
                     kafka_prev, cur, kf, dt=interval)
+                # Throughput-stall: log-end offsets frozen (msgs_per_sec ~0) for
+                # several consecutive cycles while we EXPECT traffic = a stalled
+                # pipeline even though the broker looks "up". msgs_per_sec is None
+                # on the first cycle / a counter reset → treated as no-signal
+                # (streak resets, never a false trip).
+                if kf.get("stall_enable") and _in_active_window(cfg["active_window"]):
+                    mps = metrics.get("msgs_per_sec")
+                    if mps is not None and mps <= kf.get("stall_max_msgs_per_sec", 0.0):
+                        kafka_stall_streak += 1
+                    else:
+                        kafka_stall_streak = 0
+                    if kafka_stall_streak >= kf.get("stall_cycles", 5):
+                        degraded = True
+                        reasons.append(
+                            f"no Kafka traffic — {kafka_stall_streak} cycles at "
+                            f"≤{kf.get('stall_max_msgs_per_sec', 0.0):g} msg/s "
+                            f"(pipeline stalled?)")
+                else:
+                    kafka_stall_streak = 0
                 state.set_degraded("kafka", degraded, "; ".join(reasons))
                 if kafka_latest is not None:
                     kafka_latest.clear()
